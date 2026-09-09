@@ -7,16 +7,16 @@ This skill works with agents that load SKILL.md and can run Python 3.9 or newer 
 Use the [Vercel skills CLI](https://github.com/vercel-labs/skills) to install directly from GitHub:
 
 ```bash
-npx skills add arronKler/herdr-dispatch
+npx skills add arronKler/herdr-skills --skill herdr-dispatch
 ```
 
-There is only one skill in this repository, so no `--skill` selector is needed. Choose the captain agent when prompted, or specify one explicitly:
+This repository also ships herdr-swarm; omit `--skill` to install both. Choose the captain agent when prompted, or specify one explicitly:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --agent codex --yes
+npx skills add arronKler/herdr-skills --skill herdr-dispatch --agent codex --yes
 ```
 
-Add `--global` to install for use across projects. Use `--list` to inspect the skill without installing. The repository root contains `SKILL.md`, so no subdirectory option is required.
+Add `--global` to install for use across projects. Use `--list` to inspect the skill before installing. Skills live under `skills/<name>/`, which the CLI discovers automatically.
 
 ## Prerequisites
 

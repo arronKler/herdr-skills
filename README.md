@@ -58,7 +58,46 @@ Use herdr-swarm to implement docs/spec.md: decompose it into a task tree,
 fan out the leaves, merge them one by one, and report scores after each wave.
 ```
 
-Dispatch quick start, protocol details, and error recovery live in [skills/herdr-dispatch](skills/herdr-dispatch/README.md). The swarm protocol — roles, task trees, the merge queue, field-guide memory, reviews, benchmarking — lives in [skills/herdr-swarm](skills/herdr-swarm/README.md).
+Dispatch protocol details, error recovery, and installation variants live in [herdr-dispatch references](skills/herdr-dispatch/references/): [envelope.md](skills/herdr-dispatch/references/envelope.md), [errors.md](skills/herdr-dispatch/references/errors.md), [install.md](skills/herdr-dispatch/references/install.md). The swarm protocol — roles, task trees, the merge queue, field-guide memory, reviews, benchmarking — lives in [herdr-swarm references](skills/herdr-swarm/references/).
+
+## Dispatcher quick start
+
+The bundled Python dispatcher is the primitive behind herdr-dispatch. Run commands from the project the worker should use; set `SKILL_DIR` to the installed skill directory:
+
+```bash
+SKILL_DIR="$PWD/.agents/skills/herdr-dispatch"
+python3 "$SKILL_DIR/scripts/herd-dispatch" doctor
+```
+
+Continue only when doctor reports `"ok": true`, `"herdr": true`, and `self.pane_id`. Assign an implementation task in a separate Git worktree, collect the result, then follow up:
+
+```bash
+python3 "$SKILL_DIR/scripts/herd-dispatch" assign \
+  --kind codex --role implementer --name impl-parser --worktree \
+  --message "Implement the parser change described in docs/parser-task.md. Run the relevant tests and report the changed files."
+
+python3 "$SKILL_DIR/scripts/herd-dispatch" collect \
+  --name impl-parser --wait --timeout 900000
+
+python3 "$SKILL_DIR/scripts/herd-dispatch" send \
+  --name impl-parser --wait \
+  --message "Explain the edge cases covered by the tests."
+```
+
+The worker starts from the repository's `HEAD`; uncommitted changes are not copied into its worktree. Use `--message-file /path/to/task.md` for longer instructions. `ok: true` describes the dispatch lifecycle, not the quality of the worker's work — read the file named by `deliverable` when present, otherwise inspect `result_excerpt`. Jobs are recorded in `.herd-dispatch/` under the target project; use separate worktrees for concurrent implementation tasks.
+
+| Command | Purpose |
+| --- | --- |
+| `doctor` | Check the captain environment and required Herdr commands |
+| `assign` | Start a worker and return after it enters `working` |
+| `handoff` | Start a worker and wait for the conversation to settle |
+| `collect` | Read a worker's result; add `--wait` to wait for completion |
+| `send` | Send a follow-up to an existing worker; optionally wait |
+| `models --kind <kind>` | Probe supported worker CLIs for live model IDs |
+| `status --name <name>` | Inspect a worker's current lifecycle state |
+| `stop --name <name> --yes` | Close a worker pane you created |
+
+Run `python3 "$SKILL_DIR/scripts/herd-dispatch" <command> --help` for options. Timeouts are in milliseconds; synchronous commands require a calling tool that can wait for the requested duration. See the [message and result protocol](skills/herdr-dispatch/references/envelope.md), [error recovery](skills/herdr-dispatch/references/errors.md), and the [task brief template](skills/herdr-dispatch/assets/brief-template.md).
 
 ## Where this came from
 
