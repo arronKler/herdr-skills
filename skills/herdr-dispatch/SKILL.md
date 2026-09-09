@@ -188,7 +188,7 @@ Never `herdr server stop`. Never close the captain pane.
 - Dispatch every independent assign first, then end the turn, then collect.
 - One worker per deliverable. Do not stack nested captains.
 - Prefer `--message-file` plus `--worktree` over huge pasted context.
-- Cap live workers. If more than four are `working`, collect or stop before spawning.
+- Cap live workers. If more than ten are `working`, collect or stop before spawning.
 - After collect, summarize from `deliverable` if set, else `result_excerpt`.
 - If this captain cannot wait (see Handoff), every long job is assign then later collect.
 - Judge jobs by deliverables and verification results, not by activity; busywork is not progress.

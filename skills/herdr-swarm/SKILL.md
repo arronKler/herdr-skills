@@ -26,7 +26,7 @@ Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new mo
 ## Scale limits
 
 - 3–8 leaves total in the task tree. More means the captain becomes the bottleneck; split the goal into sequential swarms instead.
-- At most 4 workers `working` at once (herdr-dispatch cap). Dispatch what fits, end the turn, collect, then dispatch the next wave.
+- At most 10 workers `working` at once (herdr-dispatch cap). Dispatch what fits, end the turn, collect, then dispatch the next wave.
 
 ## Protocol
 
