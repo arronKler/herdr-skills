@@ -17,14 +17,14 @@ What this is **not**: Cursor's scale (hundreds of agents, ~1,000 commits/sec, cu
 Install both skills with the [Vercel skills CLI](https://github.com/vercel-labs/skills) — they live in the same repository:
 
 ```bash
-npx skills add arronKler/herdr-dispatch
+npx skills add arronKler/herdr-skills
 ```
 
 That installs every skill in the repository (herdr-dispatch and herdr-swarm). To install only the swarm stack explicitly:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --skill herdr-swarm
-npx skills add arronKler/herdr-dispatch --skill herdr-dispatch
+npx skills add arronKler/herdr-skills --skill herdr-swarm
+npx skills add arronKler/herdr-skills --skill herdr-dispatch
 ```
 
 herdr-swarm requires herdr-dispatch in the same agent and the runtime described there (macOS/Linux, Python 3.9+, Herdr on PATH, the captain inside a Herdr pane).

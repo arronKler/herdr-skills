@@ -9,20 +9,20 @@ Use it for isolated implementation tasks, parallel investigation, and reviews by
 Install with the [Vercel skills CLI](https://github.com/vercel-labs/skills):
 
 ```bash
-npx skills add arronKler/herdr-dispatch --skill herdr-dispatch
+npx skills add arronKler/herdr-skills --skill herdr-dispatch
 ```
 
 This repository also ships [herdr-swarm](../herdr-swarm/README.md); omit `--skill` to install both. The installer lets you choose the target agents. To install into the current project for Codex, Claude Code, and Cursor without prompts:
 
 ```bash
-npx skills add arronKler/herdr-dispatch \
+npx skills add arronKler/herdr-skills \
   --skill herdr-dispatch --agent codex claude-code cursor --yes
 ```
 
 For a global installation, add `--global`. To inspect the repository before installing:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --list
+npx skills add arronKler/herdr-skills --list
 ```
 
 The skills live under `skills/<name>/`, a layout explicitly supported by the [CLI's discovery rules](https://github.com/vercel-labs/skills#skill-discovery). `SKILL.md` supplies the required `name` and `description`; the installer includes the accompanying scripts, references, and assets. No npm package or build step is needed for the skill itself.

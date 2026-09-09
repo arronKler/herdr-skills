@@ -16,20 +16,20 @@ herdr-swarm requires herdr-dispatch. Dispatch stands alone.
 Install with the [Vercel skills CLI](https://github.com/vercel-labs/skills). Both skills live under `skills/`, which the CLI discovers automatically:
 
 ```bash
-npx skills add arronKler/herdr-dispatch
+npx skills add arronKler/herdr-skills
 ```
 
 That installs every skill in the repository. To install only one, pass `--skill`:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --skill herdr-dispatch
-npx skills add arronKler/herdr-dispatch --skill herdr-swarm
+npx skills add arronKler/herdr-skills --skill herdr-dispatch
+npx skills add arronKler/herdr-skills --skill herdr-swarm
 ```
 
 The installer lets you choose target agents. For the current project without prompts:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --agent codex claude-code cursor --yes
+npx skills add arronKler/herdr-skills --agent codex claude-code cursor --yes
 ```
 
 Add `--global` for a global install, or `--list` to inspect before installing.
