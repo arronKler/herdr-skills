@@ -9,13 +9,13 @@ Use it for isolated implementation tasks, parallel investigation, and reviews by
 Install with the [Vercel skills CLI](https://github.com/vercel-labs/skills):
 
 ```bash
-npx skills add arronKler/herdr-dispatch --skill herdr-dispatch
+npx skills add arronKler/herdr-dispatch
 ```
 
-The installer lets you choose the target agents. To install into the current project for Codex, Claude Code, and Cursor without prompts:
+This repository contains one skill, so `--skill` is unnecessary. The installer lets you choose the target agents. To install into the current project for Codex, Claude Code, and Cursor without prompts:
 
 ```bash
-npx skills add arronKler/herdr-dispatch --skill herdr-dispatch \
+npx skills add arronKler/herdr-dispatch \
   --agent codex claude-code cursor --yes
 ```
 
@@ -25,7 +25,7 @@ For a global installation, add `--global`. To inspect the repository before inst
 npx skills add arronKler/herdr-dispatch --list
 ```
 
-This repository contains a single skill at its root. `SKILL.md` supplies the required `name` and `description`; the installer includes the accompanying scripts, references, and assets. No npm package or build step is needed for the skill itself.
+The skill lives at the repository root, a layout explicitly supported by the [CLI's discovery rules](https://github.com/vercel-labs/skills#skill-discovery). A `skills/<name>/` directory is also supported but is not required. `SKILL.md` supplies the required `name` and `description`; the installer includes the accompanying scripts, references, and assets. No npm package or build step is needed for the skill itself.
 
 ## Requirements
 
