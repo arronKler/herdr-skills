@@ -1,0 +1,1963 @@
+#!/usr/bin/env python3
+"""Deterministic Herdr dispatcher implementing assign / handoff / send_message."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+KINDS = {
+    "pi",
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "devin",
+    "agy",
+    "cline",
+    "omp",
+    "mastracode",
+    "opencode",
+    "copilot",
+    "kimi",
+    "kiro",
+    "droid",
+    "amp",
+    "grok",
+    "hermes",
+    "kilo",
+    "qodercli",
+    "qwen",
+    "maki",
+}
+# Human / binary spellings -> herdr --kind. Grok Build is kind grok.
+KIND_ALIASES = {
+    "grok-build": "grok",
+    "grokbuild": "grok",
+    "cursor-agent": "cursor",
+}
+# herdr agent start executable when it differs from the kind name.
+KIND_BINARIES = {
+    "cursor": "cursor-agent",
+}
+# Native start flag for --model. Kinds omitted here need --args.
+MODEL_FLAG = {
+    "grok": "--model",
+    "cursor": "--model",
+    "claude": "--model",
+    "codex": "--model",
+    "pi": "--model",
+    "gemini": "--model",
+}
+# Local catalog commands. Parsers consume stdout of argv after the binary.
+MODEL_PROBES = {
+    "grok": {"argv": ["models"], "parser": "grok"},
+    "cursor": {"argv": ["--list-models"], "parser": "cursor"},
+    "claude": {"argv": ["models"], "parser": "claude"},
+    "codex": {"argv": ["debug", "models"], "parser": "codex"},
+    "pi": {"argv": ["--list-models"], "parser": "pi"},
+}
+HERDR_SETTLED = {"idle", "done"}
+TUI_PREFIX_RE = re.compile(r"^[\s│|├└┐┌┬┴┼─›•]*")
+COMPOSER_STOPS = ("\n› ", "\nAsk Codex", "\n─ Worked", "\n╭─")
+CAPTAIN_JOB_FILES = frozenset({"brief.md", "input.md", "generation", "pane.md"})
+REPORT_SUFFIXES = {".md", ".txt", ".diff", ".patch"}
+PREFERRED_DELIVERABLE_NAMES = ("reply.md", "review.md")
+TUI_DUMP_MARKERS = (
+    "OpenAI Codex",
+    "Cursor Agent",
+    "Ask Codex",
+    "› Ask",
+    "─ Worked",
+    "ctrl+o to expand",
+)
+PATH_TOKEN_RE = re.compile(
+    r"`([^`\n]{1,240})`"
+    r"|((?:(?:\.{1,2}|~)?/)?"
+    r"(?:[\w.-]+/)+\.?[\w.-]+"
+    r"|[\w.-]+\.(?:md|txt|diff|patch))"
+)
+SPLIT_RATIO = 0.5
+MIN_PANE_COLS = 40
+MIN_PANE_ROWS = 12
+MAX_PANES_PER_TAB = 4
+
+
+def worker_note(cwd: Path, role: str) -> str:
+    lines = ["---"]
+    if role and role != "worker":
+        lines.append(f"Role: {role}")
+    lines.append(f"Working directory: {cwd}")
+    lines.append(
+        "You are a worker, not an orchestrator. "
+        "Do not run `herdr agent start`, `herdr pane split`, `herd-dispatch`, "
+        "or spawn any peer agent. Answer in your final reply. "
+        "If the output is long or is a deliverable, write a file and name that path in the reply."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def die(msg: str, code: int = 1, quiet: bool = False) -> None:
+    if not quiet:
+        if isinstance(msg, (dict, list)):
+            print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False), file=sys.stderr)
+        else:
+            print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False), file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(
+    args: list[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            args,
+            check=False,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        die(f"command not found: {args[0]}")
+    except subprocess.TimeoutExpired:
+        die(f"timeout running: {' '.join(args)}")
+
+
+def herdr_json(
+    args: list[str], timeout: float | None = None, quiet: bool = False
+) -> dict[str, Any]:
+    proc = run(["herdr", *args], timeout=timeout)
+    raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    payload: dict[str, Any] = {}
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    payload = json.loads(raw[start : end + 1])
+                except json.JSONDecodeError:
+                    payload = {"raw": raw, "stderr": (proc.stderr or "").strip()}
+            else:
+                payload = {"raw": raw, "stderr": (proc.stderr or "").strip()}
+    if proc.returncode != 0:
+        err = None
+        if isinstance(payload, dict):
+            err = payload.get("error") or payload.get("code") or payload.get("message")
+        die(
+            err or payload.get("raw") or f"herdr {' '.join(args)} failed ({proc.returncode})",
+            quiet=quiet,
+        )
+    if not isinstance(payload, dict):
+        return {"result": payload}
+    return payload
+
+
+def herdr_text(args: list[str], timeout: float | None = None) -> str:
+    proc = run(["herdr", *args], timeout=timeout)
+    if proc.returncode != 0:
+        die((proc.stderr or proc.stdout or f"herdr {' '.join(args)} failed").strip())
+    return proc.stdout
+
+
+def parse_herdr_payload(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                return {"raw": raw, "stderr": (proc.stderr or "").strip()}
+        else:
+            return {"raw": raw, "stderr": (proc.stderr or "").strip()}
+    if not isinstance(payload, dict):
+        return {"result": payload}
+    return payload
+
+
+def herdr_json_soft(
+    args: list[str], timeout: float | None = None
+) -> dict[str, Any] | None:
+    proc = run(["herdr", *args], timeout=timeout)
+    if proc.returncode != 0:
+        return None
+    return parse_herdr_payload(proc)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def store_dir(cwd: Path) -> Path:
+    d = cwd / ".herd-dispatch"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "jobs").mkdir(exist_ok=True)
+    gitignore = d / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*\n")
+    return d
+
+
+def load_index(cwd: Path) -> dict[str, Any]:
+    path = store_dir(cwd) / "index.json"
+    if not path.exists():
+        return {"jobs": {}}
+    return json.loads(path.read_text())
+
+
+def save_index(cwd: Path, index: dict[str, Any]) -> None:
+    path = store_dir(cwd) / "index.json"
+    path.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n")
+
+
+def job_dir(cwd: Path, name: str) -> Path:
+    d = store_dir(cwd) / "jobs" / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sidecar_path(cwd: Path, name: str) -> Path:
+    return job_dir(cwd, name) / "result.json"
+
+
+def generation_path(cwd: Path, name: str) -> Path:
+    return job_dir(cwd, name) / "generation"
+
+
+def new_generation() -> str:
+    return secrets.token_hex(8)
+
+
+def begin_generation(cwd: Path, name: str) -> str:
+    """Bookkeeping token for this prompt. Not shown to the worker."""
+    d = job_dir(cwd, name)
+    gen = new_generation()
+    generation_path(cwd, name).write_text(gen + "\n")
+    for stale in (d / "result.json", d / "RESULT.md"):
+        if stale.exists():
+            stale.unlink()
+    return gen
+
+
+def expected_generation(cwd: Path, name: str) -> str | None:
+    path = generation_path(cwd, name)
+    if path.exists():
+        token = path.read_text().strip()
+        if token:
+            return token
+    job = load_index(cwd).get("jobs", {}).get(name) or {}
+    token = job.get("generation")
+    return str(token) if token else None
+
+
+def put_job(
+    cwd: Path, name: str, record: dict[str, Any], *, generation: str | None
+) -> dict[str, Any]:
+    index = load_index(cwd)
+    jobs = index.setdefault("jobs", {})
+    payload = dict(record)
+    payload["name"] = name
+    prev = jobs.get(name) or {}
+    if generation:
+        payload["generation"] = generation
+        if prev.get("generation") != generation:
+            jobs[name] = payload
+            save_index(cwd, index)
+            return payload
+    merged = dict(prev)
+    merged.update(payload)
+    jobs[name] = merged
+    save_index(cwd, index)
+    return merged
+
+
+def require_herdr() -> None:
+    if shutil.which("herdr") is None:
+        die("herdr is not on PATH")
+    if os.environ.get("HERDR_ENV") != "1":
+        die("not inside a Herdr pane (HERDR_ENV!=1). Start the captain with `herdr` first.")
+
+
+def self_ids() -> dict[str, str]:
+    pane = os.environ.get("HERDR_PANE_ID") or ""
+    workspace = os.environ.get("HERDR_WORKSPACE_ID") or ""
+    tab = os.environ.get("HERDR_TAB_ID") or ""
+    return {"pane_id": pane, "workspace_id": workspace, "tab_id": tab}
+
+
+def agent_list() -> list[dict[str, Any]]:
+    payload = herdr_json(["agent", "list"])
+    result = payload.get("result", payload)
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("agents", "items", "list"):
+            if isinstance(result.get(key), list):
+                return result[key]
+    return []
+
+
+def find_agent(name: str) -> dict[str, Any] | None:
+    for item in agent_list():
+        if item.get("name") == name or item.get("agent_name") == name:
+            return item
+        if item.get("pane_id") == name or item.get("pane") == name:
+            return item
+    try:
+        payload = herdr_json(["agent", "get", name], quiet=True)
+    except SystemExit:
+        return None
+    result = payload.get("result", payload)
+    if isinstance(result, dict):
+        inner = result.get("agent")
+        return inner if isinstance(inner, dict) else result
+    return None
+
+
+def pane_of(agent: dict[str, Any]) -> str:
+    return (
+        agent.get("pane_id")
+        or agent.get("pane")
+        or (agent.get("pane") or {}).get("pane_id")
+        or ""
+    )
+
+
+def status_of(agent: dict[str, Any]) -> str:
+    # Modern herdr reports `agent_status`; keep legacy spellings as fallback.
+    return str(
+        agent.get("agent_status")
+        or agent.get("status")
+        or agent.get("state")
+        or agent.get("lifecycle")
+        or agent.get("lifecycle_state")
+        or ""
+    ).lower()
+
+
+def agent_status(name: str) -> str:
+    return status_of(find_agent(name) or {}) or "unknown"
+
+
+def assert_not_self(target_pane: str | None, target_name: str | None = None) -> None:
+    me = self_ids()["pane_id"]
+    if not me:
+        die("cannot resolve captain pane (HERDR_PANE_ID unset); refusing to operate")
+    if target_pane and target_pane == me:
+        die("refusing to operate on the captain pane (know-thyself)")
+    if target_name:
+        mine = find_agent(target_name)
+        if mine and pane_of(mine) == me:
+            die("refusing to operate on the captain agent")
+
+
+def sanitize_name(name: str) -> str:
+    name = name.strip().lower().replace(" ", "-")
+    name = re.sub(r"[^a-z0-9_-]", "", name)
+    if not name or not name[0].isalpha():
+        name = "w" + name
+    name = name[:32]
+    if not NAME_RE.match(name):
+        die(f"invalid agent name: {name}")
+    return name
+
+
+def unique_name(base: str) -> str:
+    base = sanitize_name(base)
+    existing = {a.get("name") or a.get("agent_name") for a in agent_list()}
+    if base not in existing:
+        return base
+    for i in range(2, 32):
+        cand = sanitize_name(f"{base[:28]}-{i}")
+        if cand not in existing:
+            return cand
+    die(f"could not allocate unique name from {base}")
+
+
+def resolve_spawn_name(explicit: str | None, role: str, kind: str) -> str:
+    """Refuse assign/handoff when an explicit --name is already live. Auto names may suffix."""
+    if explicit:
+        name = sanitize_name(explicit)
+        if find_agent(name):
+            die(
+                f"live agent named '{name}' already exists. "
+                f"Use `herd-dispatch send --name {name}`, not assign/handoff."
+            )
+        return name
+    return unique_name(f"{role}-{kind}")
+
+
+@dataclass
+class Placement:
+    pane_id: str
+    tab_id: str
+    created_pane: bool
+    created_tab: bool
+
+
+def layout_key(workspace_id: str, captain_pane_id: str) -> str:
+    return f"{workspace_id or 'unknown'}:{captain_pane_id}"
+
+
+def worker_tab_label(index: int) -> str:
+    return "herd" if index <= 0 else f"herd-{index + 1}"
+
+
+def post_split_size(
+    width: int, height: int, direction: str, ratio: float = SPLIT_RATIO
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    width = max(0, int(width))
+    height = max(0, int(height))
+    if direction == "down":
+        top = max(1, int(height * ratio)) if height else 0
+        bottom = max(0, height - top)
+        return (width, top), (width, bottom)
+    left = max(1, int(width * ratio)) if width else 0
+    right = max(0, width - left)
+    return (left, height), (right, height)
+
+
+def split_fits(
+    width: int,
+    height: int,
+    direction: str,
+    min_cols: int = MIN_PANE_COLS,
+    min_rows: int = MIN_PANE_ROWS,
+) -> bool:
+    a, b = post_split_size(width, height, direction)
+    return (
+        a[0] >= min_cols
+        and b[0] >= min_cols
+        and a[1] >= min_rows
+        and b[1] >= min_rows
+    )
+
+
+@contextmanager
+def layout_lock(cwd: Path):
+    path = store_dir(cwd) / "layout.lock"
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def save_layout_entry(
+    cwd: Path,
+    key: str,
+    entry: dict[str, Any],
+    workspace_id: str,
+    captain_pane_id: str,
+) -> None:
+    index = load_index(cwd)
+    layouts = index.setdefault("layouts", {})
+    payload = dict(entry)
+    payload["workspace_id"] = workspace_id
+    payload["captain_pane_id"] = captain_pane_id
+    layouts[key] = payload
+    save_index(cwd, index)
+
+
+def list_panes() -> list[dict[str, Any]]:
+    payload = herdr_json(["pane", "list"])
+    result = payload.get("result", payload)
+    if isinstance(result, dict) and isinstance(result.get("panes"), list):
+        return result["panes"]
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def tab_info(tab_id: str) -> dict[str, Any] | None:
+    if not tab_id:
+        return None
+    payload = herdr_json_soft(["tab", "get", tab_id])
+    if not payload:
+        return None
+    result = payload.get("result", payload)
+    if isinstance(result, dict):
+        tab = result.get("tab")
+        if isinstance(tab, dict):
+            return tab
+    return None
+
+
+def pane_layout_rects(pane_id: str) -> dict[str, dict[str, Any]]:
+    if not pane_id:
+        return {}
+    payload = herdr_json_soft(["pane", "layout", "--pane", pane_id])
+    if not payload:
+        return {}
+    result = payload.get("result", payload)
+    layout = result.get("layout") if isinstance(result, dict) else None
+    if not isinstance(layout, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for item in layout.get("panes") or []:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pane_id")
+        if pid:
+            out[str(pid)] = item.get("rect") or {}
+    return out
+
+
+def is_empty_shell(pane: dict[str, Any], captain: str) -> bool:
+    pid = str(pane.get("pane_id") or "")
+    if not pid or pid == captain:
+        return False
+    if pane.get("agent"):
+        return False
+    status = str(pane.get("agent_status") or "unknown").lower()
+    return status in ("", "unknown")
+
+
+def pane_rect_size(pane: dict[str, Any]) -> tuple[int, int]:
+    rect = pane.get("rect") or {}
+    try:
+        width = int(rect.get("width") or 0)
+    except (TypeError, ValueError):
+        width = 0
+    try:
+        height = int(rect.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    return width, height
+
+
+def pick_split_target(
+    panes: list[dict[str, Any]],
+    captain: str,
+    direction: str,
+) -> dict[str, Any] | None:
+    if len([p for p in panes if p.get("pane_id")]) >= MAX_PANES_PER_TAB:
+        return None
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for pane in panes:
+        pid = str(pane.get("pane_id") or "")
+        if not pid or pid == captain:
+            continue
+        width, height = pane_rect_size(pane)
+        if not split_fits(width, height, direction):
+            continue
+        status = str(pane.get("agent_status") or "").lower()
+        busy = 1 if status in ("working", "blocked") else 0
+        ranked.append((busy, -(width * height), pid, pane))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[0][3]
+
+
+def split_pane(cwd: Path, direction: str, pane_id: str) -> str:
+    if not pane_id:
+        die("pane split requires an explicit pane id")
+    assert_not_self(pane_id)
+    payload = herdr_json(
+        [
+            "pane",
+            "split",
+            pane_id,
+            "--direction",
+            direction,
+            "--ratio",
+            str(SPLIT_RATIO),
+            "--cwd",
+            str(cwd),
+            "--no-focus",
+        ]
+    )
+    pane = (
+        payload.get("result", {})
+        .get("pane", {})
+        .get("pane_id")
+    )
+    if not pane:
+        die(f"pane split returned no pane_id: {payload}")
+    return pane
+
+
+def create_worker_tab(workspace_id: str, cwd: Path, label: str) -> tuple[str, str]:
+    args = [
+        "tab",
+        "create",
+        "--cwd",
+        str(cwd),
+        "--label",
+        label,
+        "--no-focus",
+    ]
+    if workspace_id:
+        args.extend(["--workspace", workspace_id])
+    payload = herdr_json(args)
+    result = payload.get("result", payload)
+    tab = result.get("tab") if isinstance(result, dict) else {}
+    root = result.get("root_pane") if isinstance(result, dict) else {}
+    tab_id = (tab or {}).get("tab_id") if isinstance(tab, dict) else None
+    pane_id = (root or {}).get("pane_id") if isinstance(root, dict) else None
+    if not tab_id or not pane_id:
+        die(f"tab create returned no tab/root pane: {payload}")
+    return str(tab_id), str(pane_id)
+
+
+def close_pane_quiet(pane: str) -> None:
+    if not pane:
+        return
+    me = self_ids()["pane_id"]
+    if me and pane == me:
+        return
+    herdr_json_soft(["pane", "close", pane])
+
+
+def rename_pane_quiet(pane: str, label: str) -> None:
+    if not pane or not label:
+        return
+    herdr_json_soft(["pane", "rename", pane, label])
+
+
+def refresh_owned_tabs(
+    cwd: Path, key: str, captain: str, workspace_id: str
+) -> list[dict[str, Any]]:
+    index = load_index(cwd)
+    entry = (index.get("layouts") or {}).get(key) or {
+        "workspace_id": workspace_id,
+        "captain_pane_id": captain,
+        "tabs": [],
+    }
+    all_panes = list_panes()
+    live_tabs: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    for rec in entry.get("tabs") or []:
+        if not isinstance(rec, dict):
+            continue
+        tab_id = str(rec.get("tab_id") or "")
+        info = tab_info(tab_id)
+        if not info:
+            continue
+        rec_ws = str(info.get("workspace_id") or rec.get("workspace_id") or "")
+        if workspace_id and rec_ws and rec_ws != workspace_id:
+            continue
+        members = [p for p in all_panes if str(p.get("tab_id") or "") == tab_id]
+        if not members:
+            continue
+        probe = str(rec.get("root_pane_id") or members[0].get("pane_id") or "")
+        rects = pane_layout_rects(probe)
+        enriched: list[dict[str, Any]] = []
+        pane_ids: list[str] = []
+        for item in members:
+            pane = dict(item)
+            pid = str(pane.get("pane_id") or "")
+            if not pid:
+                continue
+            if pid in rects:
+                pane["rect"] = rects[pid]
+            enriched.append(pane)
+            pane_ids.append(pid)
+        if not pane_ids:
+            continue
+        root_id = str(rec.get("root_pane_id") or "")
+        if root_id not in pane_ids:
+            root_id = pane_ids[0]
+        live_tabs.append(
+            {
+                "tab_id": tab_id,
+                "root_pane_id": root_id,
+                "pane_ids": pane_ids,
+                "panes": enriched,
+            }
+        )
+        kept.append(
+            {
+                "tab_id": tab_id,
+                "root_pane_id": root_id,
+                "pane_ids": pane_ids,
+            }
+        )
+    if kept != list(entry.get("tabs") or []):
+        payload = dict(entry)
+        payload["tabs"] = kept
+        save_layout_entry(cwd, key, payload, workspace_id, captain)
+    return live_tabs
+
+
+def remember_owned_tab(
+    cwd: Path,
+    key: str,
+    workspace_id: str,
+    captain: str,
+    tab_id: str,
+    pane_id: str,
+    *,
+    created_tab: bool,
+) -> None:
+    index = load_index(cwd)
+    entry = (index.get("layouts") or {}).get(key) or {
+        "workspace_id": workspace_id,
+        "captain_pane_id": captain,
+        "tabs": [],
+    }
+    tabs = [dict(t) for t in (entry.get("tabs") or []) if isinstance(t, dict)]
+    found = None
+    for tab in tabs:
+        if tab.get("tab_id") == tab_id:
+            found = tab
+            break
+    if found is None:
+        found = {"tab_id": tab_id, "root_pane_id": pane_id, "pane_ids": []}
+        tabs.append(found)
+    panes = [p for p in (found.get("pane_ids") or []) if p]
+    if pane_id not in panes:
+        panes.append(pane_id)
+    found["pane_ids"] = panes
+    if created_tab or not found.get("root_pane_id"):
+        found["root_pane_id"] = pane_id
+    entry = dict(entry)
+    entry["tabs"] = tabs
+    save_layout_entry(cwd, key, entry, workspace_id, captain)
+
+
+def forget_placement(cwd: Path, placement: Placement) -> None:
+    me = self_ids()
+    key = layout_key(me["workspace_id"], me["pane_id"])
+    index = load_index(cwd)
+    entry = (index.get("layouts") or {}).get(key)
+    if not isinstance(entry, dict):
+        return
+    tabs: list[dict[str, Any]] = []
+    for tab in entry.get("tabs") or []:
+        if not isinstance(tab, dict) or tab.get("tab_id") != placement.tab_id:
+            if isinstance(tab, dict):
+                tabs.append(tab)
+            continue
+        panes = [p for p in (tab.get("pane_ids") or []) if p != placement.pane_id]
+        if placement.created_tab or not panes:
+            continue
+        updated = dict(tab)
+        updated["pane_ids"] = panes
+        if updated.get("root_pane_id") == placement.pane_id:
+            updated["root_pane_id"] = panes[0]
+        tabs.append(updated)
+    payload = dict(entry)
+    payload["tabs"] = tabs
+    save_layout_entry(cwd, key, payload, me["workspace_id"], me["pane_id"])
+
+
+def rollback_placement(cwd: Path, placement: Placement | None) -> None:
+    if not placement or not placement.created_pane:
+        return
+    close_pane_quiet(placement.pane_id)
+    forget_placement(cwd, placement)
+
+
+def place_worker_pane(cwd: Path, work_cwd: Path, direction: str) -> Placement:
+    """Put a new worker on a captain-owned tab. Never split the captain pane."""
+    me = self_ids()
+    captain = me["pane_id"]
+    if not captain:
+        die("cannot resolve captain pane (HERDR_PANE_ID unset); refusing to operate")
+    workspace_id = me["workspace_id"]
+    key = layout_key(workspace_id, captain)
+    tabs = refresh_owned_tabs(cwd, key, captain, workspace_id)
+
+    for tab in tabs:
+        for pane in tab.get("panes") or []:
+            if is_empty_shell(pane, captain):
+                pid = str(pane.get("pane_id"))
+                assert_not_self(pid)
+                return Placement(
+                    pane_id=pid,
+                    tab_id=str(tab["tab_id"]),
+                    created_pane=False,
+                    created_tab=False,
+                )
+
+    for tab in tabs:
+        target = pick_split_target(tab.get("panes") or [], captain, direction)
+        if not target:
+            continue
+        target_id = str(target.get("pane_id") or "")
+        new_pane = split_pane(work_cwd, direction, target_id)
+        try:
+            assert_not_self(new_pane)
+            remember_owned_tab(
+                cwd,
+                key,
+                workspace_id,
+                captain,
+                str(tab["tab_id"]),
+                new_pane,
+                created_tab=False,
+            )
+        except SystemExit:
+            close_pane_quiet(new_pane)
+            raise
+        return Placement(
+            pane_id=new_pane,
+            tab_id=str(tab["tab_id"]),
+            created_pane=True,
+            created_tab=False,
+        )
+
+    label = worker_tab_label(len(tabs))
+    tab_id, root = create_worker_tab(workspace_id, work_cwd, label)
+    try:
+        assert_not_self(root)
+        remember_owned_tab(
+            cwd, key, workspace_id, captain, tab_id, root, created_tab=True
+        )
+    except SystemExit:
+        close_pane_quiet(root)
+        raise
+    return Placement(
+        pane_id=root, tab_id=tab_id, created_pane=True, created_tab=True
+    )
+
+
+def maybe_worktree(cwd: Path, name: str, enabled: bool) -> Path:
+    if not enabled:
+        return cwd
+    if not (cwd / ".git").exists() and not (cwd / ".git").is_file():
+        die("--worktree requires a git repository")
+    root = cwd / ".herd-dispatch" / "worktrees" / name
+    if root.exists():
+        return root
+    branch = f"herd/{name}"
+    proc = run(
+        ["git", "-C", str(cwd), "worktree", "add", "-B", branch, str(root)],
+        check=False,
+    )
+    if proc.returncode != 0:
+        die((proc.stderr or proc.stdout or "git worktree add failed").strip())
+    return root
+
+
+def resolve_message(message: str | None, message_file: str | None) -> str:
+    if message_file:
+        path = Path(message_file)
+        if not path.exists():
+            die(f"message file not found: {path}")
+        return path.read_text()
+    if message is None:
+        die("provide --message or --message-file")
+    if message == "-":
+        return sys.stdin.read()
+    return message
+
+
+def wrap_brief(message: str, *, cwd: Path, role: str) -> str:
+    return f"{message.strip()}\n\n{worker_note(cwd, role)}"
+
+
+def wait_for_shell(pane: str, timeout_ms: int = 15000) -> None:
+    """Split panes are not immediately an interactive shell; agent start needs one."""
+    deadline = time.time() + timeout_ms / 1000
+    last = ""
+    while time.time() < deadline:
+        proc = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "12"])
+        last = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0 and last:
+            if re.search(r"[\$%❯➜#]\s*$", last, re.M) or "➜" in last:
+                return
+        time.sleep(0.25)
+    die(f"pane {pane} did not become an interactive shell: {last[-300:]}")
+
+
+def start_agent(name: str, kind: str, pane: str, extra: list[str], timeout_ms: int) -> dict[str, Any]:
+    wait_for_shell(pane)
+    args = [
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane,
+        "--timeout",
+        str(timeout_ms),
+    ]
+    if extra:
+        args.append("--")
+        args.extend(extra)
+    last_err = ""
+    for _attempt in range(8):
+        proc = run(["herdr", *args], timeout=timeout_ms / 1000 + 5)
+        raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+        last_err = raw
+        if proc.returncode == 0:
+            try:
+                return json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return {"raw": raw}
+        if "agent_pane_busy" in raw:
+            time.sleep(0.5)
+            continue
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        # agent_not_ready still reserves the name; wait for idle.
+        agent = find_agent(name)
+        if agent:
+            wait_agent(name, ["idle"], timeout_ms)
+            return {"result": agent, "note": "started_after_not_ready"}
+        err = None
+        if isinstance(payload, dict):
+            err = payload.get("error") or payload.get("code") or payload.get("message")
+        die(err or raw or f"herdr agent start failed ({proc.returncode})")
+    die(last_err or "agent_pane_busy after retries")
+
+
+def wait_agent(name: str, until: list[str], timeout_ms: int) -> dict[str, Any]:
+    args = ["agent", "wait", name, "--timeout", str(timeout_ms)]
+    for state in until:
+        args.extend(["--until", state])
+    return herdr_json(args, timeout=timeout_ms / 1000 + 5)
+
+
+def wait_agent_soft(name: str, until: list[str], timeout_ms: int) -> dict[str, Any] | None:
+    args = ["agent", "wait", name, "--timeout", str(timeout_ms)]
+    for state in until:
+        args.extend(["--until", state])
+    proc = run(["herdr", *args], timeout=timeout_ms / 1000 + 5)
+    if proc.returncode != 0:
+        return None
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw": raw}
+    return payload if isinstance(payload, dict) else {"result": payload}
+
+
+def prompt_agent(
+    name: str,
+    text: str,
+    wait: bool,
+    timeout_ms: int,
+    until: list[str] | None = None,
+) -> dict[str, Any]:
+    args = ["agent", "prompt", name, text]
+    if wait:
+        args.extend(["--wait", "--timeout", str(timeout_ms)])
+        if until:
+            for state in until:
+                args.extend(["--until", state])
+    return herdr_json(args, timeout=(timeout_ms / 1000 + 5) if wait else 30)
+
+
+def read_agent(name: str, lines: int = 400) -> str:
+    return herdr_text(
+        ["agent", "read", name, "--source", "recent-unwrapped", "--lines", str(lines)]
+    )
+
+
+def excerpt_reply(text: str, limit: int = 4000) -> str | None:
+    if not text or not text.strip():
+        return None
+    chunk = text
+    for stop in COMPOSER_STOPS:
+        cut = chunk.rfind(stop)
+        if cut > 0:
+            chunk = chunk[:cut]
+    lines = [TUI_PREFIX_RE.sub("", line).rstrip() for line in chunk.splitlines()]
+    block = "\n".join(lines).strip()
+    if not block:
+        return None
+    return block[-limit:]
+
+
+def looks_like_tui_dump(text: str) -> bool:
+    head = text.lstrip()[:2000]
+    if any(marker in head for marker in TUI_DUMP_MARKERS):
+        return True
+    if head.startswith("➜ ") and "codex" in head[:120].lower():
+        return True
+    return head.startswith("╭") and "│" in head[:400]
+
+
+def _clean_path_token(raw: str) -> str:
+    token = raw.strip().strip("`")
+    token = token.rstrip(".,:;)]}>\"'")
+    token = token.split()[0] if token.split() else token
+    return token
+
+
+def named_paths_in(text: str) -> list[str]:
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in PATH_TOKEN_RE.finditer(text):
+        token = _clean_path_token(next((g for g in match.groups() if g), "") or "")
+        if not token or token in seen:
+            continue
+        if "://" in token or token.startswith("http"):
+            continue
+        seen.add(token)
+        found.append(token)
+    return found
+
+
+def _job_search_dirs(cwd: Path, name: str, work_cwd: Path | None) -> list[Path]:
+    dirs = [job_dir(cwd, name)]
+    if work_cwd:
+        nested = work_cwd / ".herd-dispatch" / "jobs" / name
+        if nested not in dirs:
+            dirs.append(nested)
+    return dirs
+
+
+def _resolve_named_path(token: str, roots: list[Path]) -> Path | None:
+    path = Path(token).expanduser()
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.extend(root / path for root in roots)
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if resolved.is_file() and resolved.stat().st_size > 0:
+            return resolved
+    return None
+
+
+def _usable_deliverable(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    if path.name in CAPTAIN_JOB_FILES:
+        return False
+    try:
+        sample = path.read_text(errors="replace")[:4000]
+    except OSError:
+        return False
+    return not looks_like_tui_dump(sample)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _turn_stamp(job_dirs: list[Path]) -> float | None:
+    stamps: list[float] = []
+    for directory in job_dirs:
+        for filename in ("generation", "brief.md"):
+            path = directory / filename
+            if path.exists():
+                stamps.append(path.stat().st_mtime)
+    return max(stamps) if stamps else None
+
+
+def _this_turn(path: Path, stamp: float | None) -> bool:
+    if stamp is None:
+        return True
+    try:
+        return path.stat().st_mtime >= stamp - 2
+    except OSError:
+        return False
+
+
+def find_deliverable(
+    cwd: Path,
+    name: str,
+    excerpt: str | None,
+    work_cwd: Path | None = None,
+) -> Path | None:
+    """A file the worker wrote. Not RESULT JSON, not the pane TUI dump."""
+    job_dirs = _job_search_dirs(cwd, name, work_cwd)
+    roots: list[Path] = [*job_dirs, cwd]
+    if work_cwd and work_cwd not in roots:
+        roots.append(work_cwd)
+    stamp = _turn_stamp(job_dirs)
+
+    named: list[Path] = []
+    for token in named_paths_in(excerpt or ""):
+        resolved = _resolve_named_path(token, roots)
+        if resolved is None or not _usable_deliverable(resolved):
+            continue
+        if not _this_turn(resolved, stamp):
+            continue
+        in_job = any(_is_under(resolved, directory) for directory in job_dirs)
+        if in_job or resolved.suffix.lower() in REPORT_SUFFIXES:
+            named.append(resolved)
+    if named:
+        return named[0]
+
+    extras: list[Path] = []
+    for directory in job_dirs:
+        if not directory.exists():
+            continue
+        for child in directory.iterdir():
+            if child.name in CAPTAIN_JOB_FILES:
+                continue
+            if not _usable_deliverable(child):
+                continue
+            resolved = child.resolve()
+            if _this_turn(resolved, stamp):
+                extras.append(resolved)
+    if not extras:
+        return None
+    for pref in PREFERRED_DELIVERABLE_NAMES:
+        for path in extras:
+            if path.name == pref:
+                return path
+    return max(extras, key=lambda p: p.stat().st_mtime)
+
+
+def write_pane_dump(job: Path, output: str, deliverable: str | None) -> Path:
+    dump = job / "result.md"
+    if deliverable:
+        try:
+            dest = Path(deliverable).resolve()
+        except OSError:
+            dest = None
+        if dest is not None and dump.exists() and dump.resolve() == dest:
+            dump = job / "pane.md"
+    dump.write_text(output)
+    return dump
+
+
+def harvest_reply(
+    pane_text: str,
+    *,
+    cwd: Path | None = None,
+    name: str | None = None,
+    work_cwd: Path | None = None,
+) -> dict[str, Any]:
+    excerpt = excerpt_reply(pane_text)
+    harvested: dict[str, Any] = {
+        "result_excerpt": excerpt,
+        "result_source": "pane" if excerpt else None,
+    }
+    if cwd and name:
+        deliverable = find_deliverable(cwd, name, excerpt, work_cwd)
+        if deliverable is not None:
+            harvested["deliverable"] = str(deliverable)
+            harvested["result_source"] = "file"
+    return harvested
+
+
+def verdict(herdr_status: str, *, sync: bool) -> tuple[bool, str | None]:
+    """ok means this turn settled. The reply is in result_excerpt, not a grade."""
+    if herdr_status == "blocked":
+        return False, "worker is blocked on an approval or question. Inspect result and ask the human."
+    if not sync:
+        if herdr_status == "working":
+            return True, None
+        if herdr_status in HERDR_SETTLED:
+            return False, "agent_prompt_stalled: still idle/done; prompt likely never started"
+        return False, f"worker status is {herdr_status or 'unknown'}"
+    if herdr_status not in HERDR_SETTLED:
+        return False, f"worker status is {herdr_status or 'unknown'}; not idle/done"
+    return True, None
+
+
+def emit(data: dict[str, Any]) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+REQUIRED_VERBS = (
+    ("agent", "list"),
+    ("agent", "get"),
+    ("agent", "start"),
+    ("agent", "prompt"),
+    ("agent", "wait"),
+    ("agent", "read"),
+    ("pane", "split"),
+    ("pane", "close"),
+    ("pane", "list"),
+    ("pane", "layout"),
+    ("tab", "create"),
+    ("tab", "get"),
+)
+
+
+def probe_verbs() -> dict[str, bool]:
+    found: dict[str, bool] = {}
+    for verb in REQUIRED_VERBS:
+        proc = run(["herdr", *verb, "--help"])
+        found[" ".join(verb)] = proc.returncode == 0
+    return found
+
+
+def _parse_kinds(text: str) -> set[str]:
+    found: set[str] = set()
+    match = re.search(r"kinds:\s*([a-z0-9|_-]+)", text)
+    if match:
+        found.update(k for k in match.group(1).split("|") if k)
+    match = re.search(r"\[possible values:\s*([^\]]+)\]", text)
+    if match:
+        found.update(k.strip() for k in match.group(1).split(",") if k.strip())
+    return found
+
+
+def known_kinds() -> set[str]:
+    # Prefer `agent start --help` (rc 0). Fall back to `herdr agent` usage (rc 2, still has kinds:).
+    proc = run(["herdr", "agent", "start", "--help"])
+    parsed = _parse_kinds((proc.stdout or "") + (proc.stderr or ""))
+    if parsed:
+        return parsed
+    proc = run(["herdr", "agent"])
+    parsed = _parse_kinds((proc.stdout or "") + (proc.stderr or ""))
+    if parsed:
+        return parsed
+    return set(KINDS)
+
+
+def resolve_kind(kind: str) -> str:
+    key = kind.strip().lower().replace(" ", "-")
+    return KIND_ALIASES.get(key, key)
+
+
+def kind_binary(kind: str) -> str:
+    return KIND_BINARIES.get(kind, kind)
+
+
+def extra_sets_model(extra: list[str]) -> bool:
+    for item in extra:
+        if item in {"--model", "-m"} or item.startswith("--model="):
+            return True
+    return False
+
+
+def model_start_args(kind: str, model: str | None) -> list[str]:
+    if not model:
+        return []
+    flag = MODEL_FLAG.get(kind)
+    if not flag:
+        die(
+            f"kind '{kind}' has no known --model mapping. "
+            "Pass native flags with --args, or pick grok/cursor/claude/codex/pi/gemini."
+        )
+    return [flag, model]
+
+
+def merge_start_args(kind: str, model: str | None, raw_args: str) -> list[str]:
+    extra = shlex.split(raw_args) if raw_args else []
+    mapped = model_start_args(kind, model)
+    if mapped and extra_sets_model(extra):
+        die("--model and --args both set a model; keep one")
+    return mapped + extra
+
+
+def _extract_json_object(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(text[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("model catalog JSON is not an object")
+    return payload
+
+
+def parse_grok_models(text: str) -> dict[str, Any]:
+    default: str | None = None
+    match = re.search(r"(?im)^Default model:\s*(\S+)", text)
+    if match:
+        default = match.group(1)
+    models: list[dict[str, Any]] = []
+    in_list = False
+    seen: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"(?i)^Available models:\s*$", stripped):
+            in_list = True
+            continue
+        if not in_list:
+            continue
+        row = re.match(r"^[\*\-]\s+(\S+)", stripped)
+        if not row:
+            if stripped:
+                in_list = False
+            continue
+        ident = row.group(1)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        is_default = ident == default or "(default)" in stripped.lower()
+        models.append({"id": ident, "default": is_default})
+        if is_default:
+            default = ident
+    if default and default not in seen:
+        models.insert(0, {"id": default, "default": True})
+    if not models:
+        raise ValueError("unrecognized grok models output")
+    return {"default": default, "models": models}
+
+
+def parse_cursor_models(text: str) -> dict[str, Any]:
+    models: list[dict[str, Any]] = []
+    default: str | None = None
+    started = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"(?i)^Available models\s*$", stripped):
+            started = True
+            continue
+        if not started:
+            continue
+        row = re.match(r"^(\S+)\s+-\s+(.+)$", stripped)
+        if not row:
+            continue
+        ident, label = row.group(1), row.group(2).strip()
+        is_default = "(default)" in label.lower()
+        rec: dict[str, Any] = {"id": ident, "label": label, "default": is_default}
+        models.append(rec)
+        if is_default:
+            default = ident
+    if not models:
+        raise ValueError("unrecognized cursor models output")
+    return {"default": default, "models": models}
+
+
+def parse_codex_models(text: str) -> dict[str, Any]:
+    data = _extract_json_object(text)
+    items = data.get("models")
+    if not isinstance(items, list):
+        raise ValueError("codex debug models JSON missing models[]")
+    models: list[dict[str, Any]] = []
+    default: str | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("slug") or item.get("id") or item.get("name")
+        if not ident:
+            continue
+        visibility = str(item.get("visibility") or "").lower()
+        rec: dict[str, Any] = {
+            "id": str(ident),
+            "label": item.get("display_name"),
+            "hidden": visibility in {"hide", "hidden"},
+        }
+        if item.get("is_default") or item.get("default"):
+            rec["default"] = True
+            default = rec["id"]
+        else:
+            rec["default"] = False
+        models.append(rec)
+    if not models:
+        raise ValueError("codex debug models JSON had no slugs")
+    return {"default": default, "models": models}
+
+
+def parse_pi_models(text: str) -> dict[str, Any]:
+    models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = re.split(r"\s{2,}", stripped)
+        if len(parts) < 2:
+            continue
+        provider, name = parts[0], parts[1]
+        if provider.lower() == "provider" and name.lower() == "model":
+            continue
+        ident = f"{provider}/{name}"
+        if ident in seen:
+            continue
+        seen.add(ident)
+        models.append({"id": ident, "provider": provider, "default": False})
+    if not models:
+        raise ValueError("unrecognized pi --list-models output")
+    return {"default": None, "models": models}
+
+
+def parse_claude_models(text: str) -> dict[str, Any]:
+    if re.search(r"not logged in", text, re.I):
+        raise ValueError("claude is not logged in")
+    models: list[dict[str, Any]] = []
+    default: str | None = None
+    seen: set[str] = set()
+    for line in text.splitlines():
+        stripped = TUI_PREFIX_RE.sub("", line).strip()
+        if not stripped or re.match(r"(?i)^available models", stripped):
+            continue
+        row = re.match(r"^[\*\-•]\s+(\S+)(.*)$", stripped)
+        ident = None
+        rest = ""
+        if row:
+            ident, rest = row.group(1), row.group(2)
+        else:
+            row = re.match(r"^(claude-[A-Za-z0-9._-]+)\b(.*)$", stripped)
+            if row:
+                ident, rest = row.group(1), row.group(2)
+        if not ident or ident.lower() in {"model", "models", "name", "id"}:
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        is_default = "default" in rest.lower() or "default" in stripped.lower()
+        models.append({"id": ident, "default": is_default})
+        if is_default:
+            default = ident
+    if not models:
+        raise ValueError("unrecognized claude models output")
+    return {"default": default, "models": models}
+
+
+MODEL_PARSERS = {
+    "grok": parse_grok_models,
+    "cursor": parse_cursor_models,
+    "codex": parse_codex_models,
+    "pi": parse_pi_models,
+    "claude": parse_claude_models,
+}
+
+
+def probe_models(kind: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    kind = resolve_kind(kind)
+    recipe = MODEL_PROBES.get(kind)
+    binary = kind_binary(kind)
+    payload: dict[str, Any] = {"ok": False, "kind": kind, "binary": binary}
+    if not recipe:
+        payload["error"] = (
+            f"no model catalog probe for kind '{kind}'. "
+            "Pass native flags with --args if you already know the id."
+        )
+        return payload
+    path = shutil.which(binary)
+    if not path:
+        payload["error"] = f"binary not on PATH: {binary}"
+        return payload
+    argv = [binary, *recipe["argv"]]
+    payload["binary"] = path
+    payload["command"] = argv
+    try:
+        proc = subprocess.run(
+            argv,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        payload["error"] = f"binary not on PATH: {binary}"
+        return payload
+    except subprocess.TimeoutExpired:
+        payload["error"] = f"timeout listing models for {kind}"
+        return payload
+    raw = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    parser = MODEL_PARSERS.get(recipe["parser"])
+    if not parser:
+        payload["error"] = f"internal: no parser named {recipe['parser']}"
+        return payload
+    try:
+        parsed = parser(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        payload["returncode"] = proc.returncode
+        if proc.returncode != 0:
+            payload["error"] = raw[-2000:] or f"{binary} exited {proc.returncode}"
+        else:
+            payload["error"] = f"failed to parse model list: {exc}"
+            payload["raw"] = raw[-2000:]
+        return payload
+    payload["ok"] = True
+    payload.update(parsed)
+    if proc.returncode != 0:
+        payload["returncode"] = proc.returncode
+        payload["warning"] = f"{binary} exited {proc.returncode}"
+    return payload
+
+
+def cmd_doctor(_args: argparse.Namespace) -> None:
+    require_herdr()
+    me = self_ids()
+    if not me["pane_id"]:
+        die(
+            "cannot resolve captain pane (HERDR_PANE_ID unset). "
+            "Refusing to run without self-protection."
+        )
+    verbs = probe_verbs()
+    missing = sorted(v for v, ok in verbs.items() if not ok)
+    agents = agent_list()
+    captain = next((a for a in agents if pane_of(a) == me["pane_id"]), None)
+    healthy = not missing and captain is not None
+    emit(
+        {
+            "ok": healthy,
+            "herdr": True,
+            "self": me,
+            "captain_agent": captain.get("agent") if captain else None,
+            "captain_status": status_of(captain) if captain else None,
+            "agent_count": len(agents),
+            "verbs": verbs,
+            "kinds": sorted(known_kinds()),
+            "model_kinds": sorted(MODEL_PROBES),
+        }
+    )
+    if not healthy:
+        raise SystemExit(1)
+
+
+def cmd_whoami(_args: argparse.Namespace) -> None:
+    require_herdr()
+    me = self_ids()
+    match = None
+    for agent in agent_list():
+        if pane_of(agent) == me["pane_id"]:
+            match = agent
+            break
+    emit({"ok": True, "self": me, "agent": match})
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    emit({"ok": True, "agents": agent_list(), "jobs": load_index(cwd).get("jobs", {})})
+
+
+def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    kind = resolve_kind(args.kind)
+    kinds = known_kinds()
+    if kind not in kinds:
+        die(f"unknown kind '{kind}'. known: {', '.join(sorted(kinds))}")
+    name = resolve_spawn_name(args.name, args.role, kind)
+    assert_not_self(None, name)
+    work_cwd = maybe_worktree(cwd, name, args.worktree)
+    extra = merge_start_args(kind, getattr(args, "model", None), args.args)
+    created_at = now_iso()
+    placement: Placement | None = None
+    with layout_lock(cwd):
+        placement = place_worker_pane(cwd, work_cwd, args.direction)
+        assert_not_self(placement.pane_id, name)
+        try:
+            start_agent(name, kind, placement.pane_id, extra, args.start_timeout)
+        except SystemExit:
+            rollback_placement(cwd, placement)
+            raise
+        rename_pane_quiet(placement.pane_id, name)
+    pane = placement.pane_id
+    tab_id = placement.tab_id
+    generation = begin_generation(cwd, name)
+    brief = wrap_brief(
+        resolve_message(args.message, args.message_file),
+        cwd=work_cwd,
+        role=args.role,
+    )
+    prompt_path = job_dir(cwd, name) / "brief.md"
+    prompt_path.write_text(brief)
+    if mode == "assign":
+        prompt_agent(
+            name,
+            brief,
+            wait=True,
+            timeout_ms=min(120000, args.timeout),
+            until=["working", "blocked"],
+        )
+        state = agent_status(name)
+        harvested = harvest_reply("", cwd=cwd, name=name, work_cwd=work_cwd)
+        ok, err = verdict(state, sync=False)
+        record = {
+            "ok": ok,
+            "name": name,
+            "mode": "assign",
+            "kind": kind,
+            "role": args.role,
+            "pane_id": pane,
+            "tab_id": tab_id,
+            "cwd": str(work_cwd),
+            "brief": str(prompt_path),
+            "status": state,
+            "created_at": created_at,
+            "note": f"async; call `herd-dispatch collect --name {name}` later",
+            **harvested,
+        }
+        if err:
+            record["error"] = err
+        if getattr(args, "model", None):
+            record["model"] = args.model
+        return put_job(cwd, name, record, generation=generation)
+    prompt_agent(name, brief, wait=True, timeout_ms=args.timeout)
+    record = finish_sync(
+        cwd,
+        name,
+        mode="handoff",
+        kind=kind,
+        role=args.role,
+        pane=pane,
+        tab=tab_id,
+        work_cwd=work_cwd,
+        prompt_path=prompt_path,
+        lines=args.lines,
+        created_at=created_at,
+        generation=generation,
+    )
+    if getattr(args, "model", None):
+        record["model"] = args.model
+        record = put_job(cwd, name, {"model": args.model}, generation=generation)
+    return record
+
+
+def finish_sync(
+    cwd: Path,
+    name: str,
+    *,
+    mode: str,
+    kind: str | None,
+    role: str | None,
+    pane: str | None,
+    tab: str | None = None,
+    work_cwd: Path | None,
+    prompt_path: Path | None,
+    lines: int,
+    created_at: str | None,
+    generation: str | None,
+) -> dict[str, Any]:
+    state = agent_status(name)
+    output = read_agent(name, lines)
+    prev = load_index(cwd).get("jobs", {}).get(name) or {}
+    if work_cwd is None and prev.get("cwd"):
+        work_cwd = Path(str(prev["cwd"]))
+    job = job_dir(cwd, name)
+    harvested = harvest_reply(output, cwd=cwd, name=name, work_cwd=work_cwd)
+    result_path = write_pane_dump(job, output, harvested.get("deliverable"))
+    ok, err = verdict(state, sync=True)
+    record: dict[str, Any] = {
+        "ok": ok,
+        "name": name,
+        "mode": mode,
+        "status": state,
+        "result": str(result_path),
+        "finished_at": now_iso(),
+        **harvested,
+    }
+    if kind:
+        record["kind"] = kind
+    if role:
+        record["role"] = role
+    if pane:
+        record["pane_id"] = pane
+    if tab:
+        record["tab_id"] = tab
+    if work_cwd:
+        record["cwd"] = str(work_cwd)
+    if prompt_path:
+        record["brief"] = str(prompt_path)
+    if created_at:
+        record["created_at"] = created_at
+    if err:
+        record["error"] = err
+    return put_job(cwd, name, record, generation=generation)
+
+
+def wait_for_task(name: str, cwd: Path, timeout_ms: int, generation: str | None) -> str:
+    """Do not treat boot-idle as finished. Wait until this prompt works, then settles."""
+    state = agent_status(name)
+    if state == "blocked":
+        return state
+    if state == "working":
+        wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
+        return agent_status(name)
+    if state in HERDR_SETTLED:
+        wait_agent_soft(name, ["working", "blocked"], min(120000, timeout_ms))
+        state = agent_status(name)
+        if state == "working":
+            wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
+        return agent_status(name)
+    wait_agent_soft(name, ["idle", "done", "blocked", "working"], timeout_ms)
+    state = agent_status(name)
+    if state == "working":
+        wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
+        return agent_status(name)
+    return state
+
+
+def cmd_models(args: argparse.Namespace) -> None:
+    payload = probe_models(args.kind)
+    emit(payload)
+    if not payload.get("ok"):
+        raise SystemExit(1)
+
+
+def cmd_assign(args: argparse.Namespace) -> None:
+    emit(spawn(args, "assign"))
+
+
+def cmd_handoff(args: argparse.Namespace) -> None:
+    emit(spawn(args, "handoff"))
+
+
+def cmd_send(args: argparse.Namespace) -> None:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    name = args.name
+    agent = find_agent(name)
+    if not agent:
+        die(f"no live agent named {name}")
+    assert_not_self(pane_of(agent), name)
+    if status_of(agent) == "blocked" and not args.force:
+        die("agent is blocked. Inspect with `herd-dispatch result` and ask the human before --force")
+    created_at = now_iso()
+    generation = begin_generation(cwd, name)
+    text = resolve_message(args.message, args.message_file)
+    if args.wait:
+        prompt_agent(name, text, wait=True, timeout_ms=args.timeout)
+        record = finish_sync(
+            cwd,
+            name,
+            mode="send_message",
+            kind=None,
+            role=None,
+            pane=pane_of(agent),
+            work_cwd=None,
+            prompt_path=None,
+            lines=args.lines,
+            created_at=created_at,
+            generation=generation,
+        )
+        record["sent_at"] = created_at
+        emit(record)
+        return
+    prompt_agent(name, text, wait=False, timeout_ms=args.timeout)
+    wait_agent_soft(name, ["working", "blocked"], min(120000, args.timeout))
+    state = agent_status(name)
+    harvested = harvest_reply("", cwd=cwd, name=name)
+    ok, err = verdict(state, sync=False)
+    record = {
+        "ok": ok,
+        "name": name,
+        "mode": "send_message",
+        "status": state,
+        "sent_at": created_at,
+        "created_at": created_at,
+        **harvested,
+    }
+    if err:
+        record["error"] = err
+    put_job(cwd, name, record, generation=generation)
+    emit(record)
+
+
+def cmd_collect(args: argparse.Namespace) -> None:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    name = args.name
+    agent = find_agent(name)
+    if not agent:
+        die(f"no live agent named {name}")
+    assert_not_self(pane_of(agent), name)
+    generation = expected_generation(cwd, name)
+    if args.wait:
+        wait_for_task(name, cwd, args.timeout, generation)
+    record = finish_sync(
+        cwd,
+        name,
+        mode="collect",
+        kind=None,
+        role=None,
+        pane=pane_of(agent),
+        work_cwd=None,
+        prompt_path=None,
+        lines=args.lines,
+        created_at=None,
+        generation=generation,
+    )
+    record["collected_at"] = now_iso()
+    put_job(
+        cwd,
+        name,
+        {"collected_at": record["collected_at"]},
+        generation=record.get("generation") or generation,
+    )
+    emit(record)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    require_herdr()
+    agent = find_agent(args.name)
+    if not agent:
+        die(f"no live agent named {args.name}")
+    emit({"ok": True, "name": args.name, "status": status_of(agent), "agent": agent})
+
+
+def cmd_result(args: argparse.Namespace) -> None:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    name = args.name
+    path = job_dir(cwd, name) / "result.md"
+    prev = load_index(cwd).get("jobs", {}).get(name) or {}
+    work_cwd = Path(str(prev["cwd"])) if prev.get("cwd") else None
+    if path.exists() and not args.refresh:
+        harvested = harvest_reply(
+            path.read_text(), cwd=cwd, name=name, work_cwd=work_cwd
+        )
+        emit(
+            {
+                "ok": True,
+                "name": name,
+                "result": str(path),
+                "cached": True,
+                **harvested,
+            }
+        )
+        return
+    output = read_agent(name, args.lines)
+    harvested = harvest_reply(output, cwd=cwd, name=name, work_cwd=work_cwd)
+    path = write_pane_dump(job_dir(cwd, name), output, harvested.get("deliverable"))
+    state = agent_status(name)
+    ok, err = verdict(state, sync=True)
+    payload = {
+        "ok": ok,
+        "name": name,
+        "status": state,
+        "result": str(path),
+        "preview": output[-4000:],
+        **harvested,
+    }
+    if err:
+        payload["error"] = err
+    emit(payload)
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    require_herdr()
+    agent = find_agent(args.name)
+    if not agent:
+        die(f"no live agent named {args.name}")
+    pane = pane_of(agent)
+    assert_not_self(pane, args.name)
+    if not args.yes:
+        die("refusing to close a pane without --yes")
+    herdr_json(["pane", "close", pane])
+    emit({"ok": True, "stopped": args.name, "pane_id": pane})
+
+
+def add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--cwd", default=os.environ.get("PWD") or os.getcwd())
+    p.add_argument("--timeout", type=int, default=900000, help="prompt/wait timeout ms")
+    p.add_argument("--start-timeout", type=int, default=30000)
+    p.add_argument("--lines", type=int, default=400)
+
+
+def add_spawn(p: argparse.ArgumentParser) -> None:
+    add_common(p)
+    p.add_argument("--name", help="live agent name, [a-z][a-z0-9_-]{0,31}")
+    p.add_argument(
+        "--kind",
+        required=True,
+        help="herdr agent kind, e.g. grok, cursor, codex, claude, pi, omp",
+    )
+    p.add_argument("--role", default="worker")
+    p.add_argument("--message")
+    p.add_argument("--message-file")
+    p.add_argument(
+        "--model",
+        help="native model id for this kind; discover with models --kind",
+    )
+    p.add_argument("--args", default="", help="native CLI args after --")
+    p.add_argument("--direction", choices=["right", "down"], default="right")
+    p.add_argument("--worktree", action="store_true")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="herd-dispatch")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("doctor")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("whoami")
+    p.set_defaults(func=cmd_whoami)
+
+    p = sub.add_parser("list")
+    p.add_argument("--cwd", default=os.environ.get("PWD") or os.getcwd())
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("models")
+    p.add_argument(
+        "--kind",
+        required=True,
+        help="herdr agent kind whose local CLI should list models",
+    )
+    p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser("assign")
+    add_spawn(p)
+    p.set_defaults(func=cmd_assign)
+
+    p = sub.add_parser("handoff")
+    add_spawn(p)
+    p.set_defaults(func=cmd_handoff)
+
+    p = sub.add_parser("send")
+    add_common(p)
+    p.add_argument("--name", required=True)
+    p.add_argument("--message")
+    p.add_argument("--message-file")
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("collect")
+    add_common(p)
+    p.add_argument("--name", required=True)
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("status")
+    p.add_argument("--name", required=True)
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("result")
+    add_common(p)
+    p.add_argument("--name", required=True)
+    p.add_argument("--refresh", action="store_true")
+    p.set_defaults(func=cmd_result)
+
+    p = sub.add_parser("stop")
+    p.add_argument("--name", required=True)
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_stop)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

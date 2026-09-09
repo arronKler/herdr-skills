@@ -1,0 +1,28 @@
+# Local dispatch state and worktrees
+.herd-dispatch/
+.worktrees/
+
+# Runtime logs
+log/
+logs/
+*.log
+*.log.*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration and OS metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Installer output from local smoke checks
+node_modules/
+.agents/
+.claude/
+skills-lock.json
