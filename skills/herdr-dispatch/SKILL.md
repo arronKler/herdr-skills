@@ -100,6 +100,16 @@ python3 scripts/herd-dispatch send \
 
 `--wait` makes it a synchronous follow-up: just the message, then the reply. Same tool-timeout rule as Handoff. Without `--wait`, fire and `collect` later. If the worker is already `blocked`, the script refuses unless the human explicitly asked you to `--force`.
 
+## Surprise memory (field guide)
+
+`.field-guide/` at the repository root accumulates what workers learn the hard way: model weights are frozen, so only **surprises** earn an entry — environment quirks, non-obvious invariants, approaches that looked right and failed.
+
+- Point every job brief at the guide files relevant to that job, plus any new or recently corrected entries.
+- Ask workers to report surprises in their deliverable. At collect time, transcribe the lasting ones into the guide yourself: short dated entries citing paths or error strings, no opinions. Workers never edit the guide.
+- Append only; stale entries get a dated one-line correction, never a rewrite.
+
+The guide belongs to the repository and outlives any job. It needs no protocol to be useful — an unmentioned guide still helps workers that look.
+
 ## Model
 
 `--model` is a spawn-time flag on `assign` / `handoff`. The script maps it to that kind's native start argument (`grok --model`, `cursor-agent --model`, and the same for claude/codex/pi/gemini). `send` cannot change the model of an already-started worker.
@@ -181,6 +191,7 @@ Never `herdr server stop`. Never close the captain pane.
 - Cap live workers. If more than four are `working`, collect or stop before spawning.
 - After collect, summarize from `deliverable` if set, else `result_excerpt`.
 - If this captain cannot wait (see Handoff), every long job is assign then later collect.
+- Judge jobs by deliverables and verification results, not by activity; busywork is not progress.
 
 ## References
 
