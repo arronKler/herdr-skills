@@ -14,7 +14,7 @@ Model weights are frozen: the guide is the only place learned knowledge persists
 
 ## Rules
 
-- Workers append; nobody edits or deletes existing entries. Stale entries get a dated one-line correction from the captain, never a rewrite.
+- Entries are append-only: nobody edits or deletes existing entries. Stale entries get a dated one-line correction from the captain, never a rewrite.
 - One short file per topic (`build-quirks.md`, `test-harness.md`, …). A new entry that grows past ~30 lines gets split by the captain.
 - Every leaf brief lists which guide files are required reading. A worker that hits an unrecorded surprise notes it in its deliverable under `## field guide additions`; the captain transcribes those into the guide at merge time. Workers never write to the guide directly — the captain curates, so the guide never accumulates noise.
 - Entries cite what happened and where (paths, error strings), not opinions.

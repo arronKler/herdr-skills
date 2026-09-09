@@ -28,6 +28,16 @@ Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new mo
 - 3–8 leaves total in the task tree. More means the captain becomes the bottleneck; split the goal into sequential swarms instead.
 - At most 10 workers `working` at once (herdr-dispatch cap). Dispatch what fits, end the turn, collect, then dispatch the next wave.
 
+## Model mix
+
+Follow the blog's model economics: very little of a big task truly needs frontier intelligence — the initial decomposition, the design decisions, the key trade-offs. Everything else is execution against a settled spec, which cheaper models do well:
+
+- **Planning**: the strongest model available — that is this captain session.
+- **Implementation leaves**: prefer fast, cheap kinds (see herdr-dispatch routing defaults). Once the captain has collapsed uncertainty into frozen contracts, leaf work is mechanical.
+- **Arbiter and reviewers**: cheap kinds first; only bump up if a round fails.
+
+All-frontier runs cost several times more for roughly the same quality; a second-rate planner that reasons efficiently can beat a pricier one by generating less work.
+
 ## Protocol
 
 ### 1. Plan the tree
@@ -47,6 +57,7 @@ Create once, at the repository root:
 - `.herd-swarm/decisions.md` — the shared design record. The captain appends one dated entry per decision. Workers read it; workers never write to it. If a worker needs a decision, it reports the question in its deliverable and stops short of guessing.
 - `.field-guide/` (repository root) — stigmergy memory, see [references/field-guide.md](references/field-guide.md).
 - `.herd-swarm/tree.md` — the current task tree: leaves, owners, status (`planned` / `working` / `merged` / `failed`).
+- `.herd-swarm/runs.md` — only when there is an eval; see [references/benchmarking.md](references/benchmarking.md).
 
 ### 3. Dispatch wave by wave
 
