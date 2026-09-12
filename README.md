@@ -6,7 +6,7 @@ This repository holds two skills:
 
 | Skill | What it does |
 | --- | --- |
-| [herdr-dispatch](skills/herdr-dispatch/) | The primitive layer. A captain agent assigns work to another CLI (Claude, Codex, Pi, Grok Build, Cursor, …), waits for a handoff, collects results, and sends follow-ups through a bundled Python dispatcher. |
+| [herdr-dispatch](skills/herdr-dispatch/) | The primitive layer. A captain agent assigns work to another CLI (Claude, Codex, Pi, Grok Build, Cursor, …), monitors the fleet, waits for a handoff, collects results, and sends follow-ups through a bundled Python dispatcher. |
 | [herdr-swarm](skills/herdr-swarm/) | Small-scale swarms (3–8 workers) built strictly on top of herdr-dispatch: ownership-split task trees, a merge queue with neutral arbitration, shared decision logs, field-guide memory, and hidden-eval benchmarking. |
 
 herdr-swarm requires herdr-dispatch. Dispatch stands alone.
@@ -76,8 +76,11 @@ python3 "$SKILL_DIR/scripts/herd-dispatch" assign \
   --kind codex --role implementer --name impl-parser --worktree \
   --message "Implement the parser change described in docs/parser-task.md. Run the relevant tests and report the changed files."
 
-python3 "$SKILL_DIR/scripts/herd-dispatch" collect \
-  --name impl-parser --wait --timeout 900000
+python3 "$SKILL_DIR/scripts/herd-dispatch" watch \
+  --name impl-parser --timeout 30000
+
+# Repeat watch while action is wait. Once action is collect:
+python3 "$SKILL_DIR/scripts/herd-dispatch" collect --name impl-parser
 
 python3 "$SKILL_DIR/scripts/herd-dispatch" send \
   --name impl-parser --wait \
@@ -89,15 +92,16 @@ The worker starts from the repository's `HEAD`; uncommitted changes are not copi
 | Command | Purpose |
 | --- | --- |
 | `doctor` | Check the captain environment and required Herdr commands |
-| `assign` | Start a worker and return after it enters `working` |
+| `assign` | Start a worker; confirm delivery or return a recoverable unconfirmed result |
 | `handoff` | Start a worker and wait for the conversation to settle |
-| `collect` | Read a worker's result; add `--wait` to wait for completion |
+| `watch` | Monitor a whole wave; return changed jobs and collect/inspect/wait actions |
+| `collect` | Read a worker's result; add `--wait` for a single outstanding job |
 | `send` | Send a follow-up to an existing worker; optionally wait |
 | `models --kind <kind>` | Probe supported worker CLIs for live model IDs |
 | `status --name <name>` | Inspect a worker's current lifecycle state |
 | `stop --name <name> --yes` | Close a worker pane you created |
 
-Run `python3 "$SKILL_DIR/scripts/herd-dispatch" <command> --help` for options. Timeouts are in milliseconds; synchronous commands require a calling tool that can wait for the requested duration. See the [message and result protocol](skills/herdr-dispatch/references/envelope.md), [error recovery](skills/herdr-dispatch/references/errors.md), and the [task brief template](skills/herdr-dispatch/assets/brief-template.md).
+Run `python3 "$SKILL_DIR/scripts/herd-dispatch" <command> --help` for options. Timeouts are in milliseconds. `watch` defaults to 30 seconds (maximum 60); continue reading any background handle returned by the calling tool. Prompt stalls/timeouts are unconfirmed delivery, not permission to resend. Collect the current turn before `send`; it refuses working workers and unconfirmed prior prompts. See the [message and result protocol](skills/herdr-dispatch/references/envelope.md), [error recovery](skills/herdr-dispatch/references/errors.md), and the [task brief template](skills/herdr-dispatch/assets/brief-template.md).
 
 ## Where this came from
 
@@ -108,7 +112,7 @@ herdr-swarm distills Cursor's research blog *Agent swarms and the new model econ
 From a clone of this repository:
 
 ```bash
-python3 skills/herdr-dispatch/scripts/test_herd_dispatch.py
+python3 -m unittest discover -s skills/herdr-dispatch/scripts -p 'test_*.py'
 python3 skills/herdr-dispatch/scripts/herd-dispatch --help
 npx skills add . --list
 ```

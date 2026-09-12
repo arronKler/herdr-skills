@@ -8,7 +8,6 @@ import fcntl
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import subprocess
@@ -19,6 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from dispatch_store import (
+    begin_generation, expected_generation, generation_path, index_lock, job_dir,
+    job_lock, load_index, put_job, save_index, sidecar_path, store_dir,
+)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 KINDS = {
@@ -75,7 +79,7 @@ MODEL_PROBES = {
 HERDR_SETTLED = {"idle", "done"}
 TUI_PREFIX_RE = re.compile(r"^[\s│|├└┐┌┬┴┼─›•]*")
 COMPOSER_STOPS = ("\n› ", "\nAsk Codex", "\n─ Worked", "\n╭─")
-CAPTAIN_JOB_FILES = frozenset({"brief.md", "input.md", "generation", "pane.md"})
+CAPTAIN_JOB_FILES = frozenset({"brief.md", "input.md", "generation", "pane.md", "submit.lock"})
 REPORT_SUFFIXES = {".md", ".txt", ".diff", ".patch"}
 PREFERRED_DELIVERABLE_NAMES = ("reply.md", "review.md")
 TUI_DUMP_MARKERS = (
@@ -215,88 +219,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def store_dir(cwd: Path) -> Path:
-    d = cwd / ".herd-dispatch"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "jobs").mkdir(exist_ok=True)
-    gitignore = d / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("*\n")
-    return d
-
-
-def load_index(cwd: Path) -> dict[str, Any]:
-    path = store_dir(cwd) / "index.json"
-    if not path.exists():
-        return {"jobs": {}}
-    return json.loads(path.read_text())
-
-
-def save_index(cwd: Path, index: dict[str, Any]) -> None:
-    path = store_dir(cwd) / "index.json"
-    path.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n")
-
-
-def job_dir(cwd: Path, name: str) -> Path:
-    d = store_dir(cwd) / "jobs" / name
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def sidecar_path(cwd: Path, name: str) -> Path:
-    return job_dir(cwd, name) / "result.json"
-
-
-def generation_path(cwd: Path, name: str) -> Path:
-    return job_dir(cwd, name) / "generation"
-
-
-def new_generation() -> str:
-    return secrets.token_hex(8)
-
-
-def begin_generation(cwd: Path, name: str) -> str:
-    """Bookkeeping token for this prompt. Not shown to the worker."""
-    d = job_dir(cwd, name)
-    gen = new_generation()
-    generation_path(cwd, name).write_text(gen + "\n")
-    for stale in (d / "result.json", d / "RESULT.md"):
-        if stale.exists():
-            stale.unlink()
-    return gen
-
-
-def expected_generation(cwd: Path, name: str) -> str | None:
-    path = generation_path(cwd, name)
-    if path.exists():
-        token = path.read_text().strip()
-        if token:
-            return token
-    job = load_index(cwd).get("jobs", {}).get(name) or {}
-    token = job.get("generation")
-    return str(token) if token else None
-
-
-def put_job(
-    cwd: Path, name: str, record: dict[str, Any], *, generation: str | None
-) -> dict[str, Any]:
-    index = load_index(cwd)
-    jobs = index.setdefault("jobs", {})
-    payload = dict(record)
-    payload["name"] = name
-    prev = jobs.get(name) or {}
-    if generation:
-        payload["generation"] = generation
-        if prev.get("generation") != generation:
-            jobs[name] = payload
-            save_index(cwd, index)
-            return payload
-    merged = dict(prev)
-    merged.update(payload)
-    jobs[name] = merged
-    save_index(cwd, index)
-    return merged
-
 
 def require_herdr() -> None:
     if shutil.which("herdr") is None:
@@ -312,8 +234,8 @@ def self_ids() -> dict[str, str]:
     return {"pane_id": pane, "workspace_id": workspace, "tab_id": tab}
 
 
-def agent_list() -> list[dict[str, Any]]:
-    payload = herdr_json(["agent", "list"])
+def agent_list(timeout: float | None = None) -> list[dict[str, Any]]:
+    payload = herdr_json(["agent", "list"], timeout=timeout)
     result = payload.get("result", payload)
     if isinstance(result, list):
         return result
@@ -479,13 +401,14 @@ def save_layout_entry(
     workspace_id: str,
     captain_pane_id: str,
 ) -> None:
-    index = load_index(cwd)
-    layouts = index.setdefault("layouts", {})
-    payload = dict(entry)
-    payload["workspace_id"] = workspace_id
-    payload["captain_pane_id"] = captain_pane_id
-    layouts[key] = payload
-    save_index(cwd, index)
+    with index_lock(cwd):
+        index = load_index(cwd)
+        layouts = index.setdefault("layouts", {})
+        payload = dict(entry)
+        payload["workspace_id"] = workspace_id
+        payload["captain_pane_id"] = captain_pane_id
+        layouts[key] = payload
+        save_index(cwd, index)
 
 
 def list_panes() -> list[dict[str, Any]]:
@@ -944,23 +867,6 @@ def wait_agent(name: str, until: list[str], timeout_ms: int) -> dict[str, Any]:
     return herdr_json(args, timeout=timeout_ms / 1000 + 5)
 
 
-def wait_agent_soft(name: str, until: list[str], timeout_ms: int) -> dict[str, Any] | None:
-    args = ["agent", "wait", name, "--timeout", str(timeout_ms)]
-    for state in until:
-        args.extend(["--until", state])
-    proc = run(["herdr", *args], timeout=timeout_ms / 1000 + 5)
-    if proc.returncode != 0:
-        return None
-    raw = (proc.stdout or "").strip()
-    if not raw:
-        return {}
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
-    return payload if isinstance(payload, dict) else {"result": payload}
-
-
 def prompt_agent(
     name: str,
     text: str,
@@ -974,7 +880,20 @@ def prompt_agent(
         if until:
             for state in until:
                 args.extend(["--until", state])
-    return herdr_json(args, timeout=(timeout_ms / 1000 + 5) if wait else 30)
+    try:
+        proc = subprocess.run(
+            ["herdr", *args], capture_output=True, text=True,
+            timeout=max(0.001, timeout_ms / 1000),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # The server may already have accepted the prompt. Never replay it here.
+        return {"ok": False, "error": {"code": "prompt_transport_unknown", "message": str(exc)}}
+    payload = parse_herdr_payload(proc)
+    if proc.returncode != 0 or payload.get("error") or payload.get("ok") is False:
+        return {"ok": False, "error": payload.get("error") or payload or "prompt failed"}
+    if not payload or "raw" in payload or ("result" not in payload and payload.get("ok") is not True):
+        return {"ok": False, "error": {"code": "invalid_prompt_response", "message": "delivery unconfirmed"}}
+    return {"ok": True, "response": payload}
 
 
 def read_agent(name: str, lines: int = 400) -> str:
@@ -1090,7 +1009,7 @@ def _this_turn(path: Path, stamp: float | None) -> bool:
     if stamp is None:
         return True
     try:
-        return path.stat().st_mtime >= stamp - 2
+        return path.stat().st_mtime >= stamp
     except OSError:
         return False
 
@@ -1143,14 +1062,7 @@ def find_deliverable(
 
 
 def write_pane_dump(job: Path, output: str, deliverable: str | None) -> Path:
-    dump = job / "result.md"
-    if deliverable:
-        try:
-            dest = Path(deliverable).resolve()
-        except OSError:
-            dest = None
-        if dest is not None and dump.exists() and dump.resolve() == dest:
-            dump = job / "pane.md"
+    dump = job / "pane.md"
     dump.write_text(output)
     return dump
 
@@ -1183,7 +1095,7 @@ def verdict(herdr_status: str, *, sync: bool) -> tuple[bool, str | None]:
         if herdr_status == "working":
             return True, None
         if herdr_status in HERDR_SETTLED:
-            return False, "agent_prompt_stalled: still idle/done; prompt likely never started"
+            return False, "agent_prompt_stalled: still idle/done; delivery unconfirmed; inspect before any resend"
         return False, f"worker status is {herdr_status or 'unknown'}"
     if herdr_status not in HERDR_SETTLED:
         return False, f"worker status is {herdr_status or 'unknown'}; not idle/done"
@@ -1550,6 +1462,112 @@ def cmd_list(args: argparse.Namespace) -> None:
     emit({"ok": True, "agents": agent_list(), "jobs": load_index(cwd).get("jobs", {})})
 
 
+def observe_job(
+    cwd: Path, name: str, record: dict[str, Any], agent: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Reconcile lifecycle without submitting input or inferring work quality."""
+    matched = (agent is not None and pane_of(agent) == record.get("pane_id")
+               and (not agent.get("name") or agent["name"] == name))
+    state = (status_of(agent) or "unknown") if matched else "unknown"
+    delivery = record.get("delivery", "unconfirmed")
+    sequence = agent.get("state_change_seq") if matched else None
+    baseline = record.get("baseline_seq")
+    advanced = isinstance(sequence, int) and isinstance(baseline, int) and sequence > baseline
+    if delivery == "unconfirmed" and matched and (
+        state == "working" or (advanced and state in HERDR_SETTLED)
+    ):
+        delivery = "confirmed"
+    ok = delivery == "confirmed" and state in {"working", *HERDR_SETTLED}
+    error = None
+    if not matched:
+        error = "worker missing or pane identity changed; inspect before replacing"
+    elif state == "blocked":
+        error = "worker blocked; inspect the approval or question"
+    elif delivery == "rejected":
+        error = "prompt rejected before submission; inspect prompt_error"
+    elif delivery != "confirmed":
+        error = "prompt delivery unconfirmed; watch or inspect, do not resend"
+    elif not ok:
+        error = f"worker status is {state}; inspect before continuing"
+    return put_job(cwd, name, {
+        "status": state, "delivery": delivery, "ok": ok, "error": error,
+        "state_change_seq": sequence,
+    }, generation=record.get("generation"))
+
+
+def fleet_snapshot(timeout: float) -> tuple[list[dict[str, Any]], str | None]:
+    """Bounded, read-only probe; a transport failure is not an empty fleet."""
+    try:
+        proc = subprocess.run(["herdr", "agent", "list"], capture_output=True,
+                              text=True, timeout=max(0.001, timeout))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"fleet observation unavailable: {exc}"
+    payload = parse_herdr_payload(proc)
+    result = payload.get("result", payload)
+    if proc.returncode == 0 and not payload.get("error"):
+        if isinstance(result, list):
+            return result, None
+        if isinstance(result, dict):
+            for key in ("agents", "items", "list"):
+                if isinstance(result.get(key), list):
+                    return result[key], None
+    return [], f"fleet observation unavailable: {payload}"
+
+
+def recover_job_identity(cwd: Path, name: str, agent: dict[str, Any]) -> dict[str, Any]:
+    """Repair legacy send indexes without adopting a replacement pane."""
+    record = load_index(cwd).get("jobs", {}).get(name) or {}
+    if not record:
+        die(f"no recorded job named {name}; inspect the worker before continuing")
+    if record.get("pane_id") and record["pane_id"] != pane_of(agent):
+        return record
+    identity = {k: record.get(k) or agent.get(k) for k in ("pane_id", "cwd", "tab_id")}
+    if "delivery" not in record:
+        # Older successful async/sync results already observed lifecycle progress.
+        identity["delivery"] = "confirmed" if record.get("ok") and record.get("status") in {"working", *HERDR_SETTLED} else "unconfirmed"
+    return put_job(cwd, name, identity, generation=record.get("generation"))
+
+
+def observe_current_job(cwd: Path, name: str, timeout: float = 5) -> dict[str, Any]:
+    record = load_index(cwd).get("jobs", {}).get(name) or {}
+    agents, error = fleet_snapshot(timeout)
+    if error:
+        return put_job(cwd, name, {"ok": False, "status": "unknown", "error": error},
+                       generation=record.get("generation"))
+    agent = next((a for a in agents if pane_of(a) == record.get("pane_id")), None)
+    return observe_job(cwd, name, record, agent)
+
+
+def submit_job(cwd: Path, name: str, text: str, *, sync: bool, timeout_ms: int) -> dict[str, Any]:
+    # Caller persisted identity and a baseline under the submit lock before entry.
+    budget = timeout_ms if sync else min(timeout_ms, 30000)
+    deadline = time.monotonic() + budget / 1000
+    response = prompt_agent(
+        name, text, wait=True, timeout_ms=min(budget, 10000),
+        until=["working", "idle", "done", "blocked"],
+    )
+    record = load_index(cwd)["jobs"][name]
+    error = response.get("error")
+    rejected = isinstance(error, dict) and error.get("code") == "agent_blocked"
+    record = put_job(cwd, name, {
+        "delivery": "confirmed" if response.get("ok") else ("rejected" if rejected else "unconfirmed"),
+        "prompt_error": error,
+    }, generation=record["generation"])
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return record
+        record = observe_current_job(cwd, name, timeout=min(5, remaining))
+        if record["status"] in {"blocked", "unknown"} or record["delivery"] == "rejected":
+            return record
+        if record["delivery"] == "confirmed" and (not sync or record["status"] in HERDR_SETTLED):
+            return record
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return record
+        time.sleep(min(1, remaining))
+
+
 def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     require_herdr()
     cwd = Path(args.cwd).resolve()
@@ -1559,79 +1577,42 @@ def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
         die(f"unknown kind '{kind}'. known: {', '.join(sorted(kinds))}")
     name = resolve_spawn_name(args.name, args.role, kind)
     assert_not_self(None, name)
-    work_cwd = maybe_worktree(cwd, name, args.worktree)
+    message = resolve_message(args.message, args.message_file)
     extra = merge_start_args(kind, getattr(args, "model", None), args.args)
-    created_at = now_iso()
-    placement: Placement | None = None
-    with layout_lock(cwd):
-        placement = place_worker_pane(cwd, work_cwd, args.direction)
-        assert_not_self(placement.pane_id, name)
-        try:
-            start_agent(name, kind, placement.pane_id, extra, args.start_timeout)
-        except SystemExit:
-            rollback_placement(cwd, placement)
-            raise
-        rename_pane_quiet(placement.pane_id, name)
-    pane = placement.pane_id
-    tab_id = placement.tab_id
-    generation = begin_generation(cwd, name)
-    brief = wrap_brief(
-        resolve_message(args.message, args.message_file),
-        cwd=work_cwd,
-        role=args.role,
-    )
-    prompt_path = job_dir(cwd, name) / "brief.md"
-    prompt_path.write_text(brief)
-    if mode == "assign":
-        prompt_agent(
-            name,
-            brief,
-            wait=True,
-            timeout_ms=min(120000, args.timeout),
-            until=["working", "blocked"],
-        )
-        state = agent_status(name)
-        harvested = harvest_reply("", cwd=cwd, name=name, work_cwd=work_cwd)
-        ok, err = verdict(state, sync=False)
-        record = {
-            "ok": ok,
-            "name": name,
-            "mode": "assign",
-            "kind": kind,
-            "role": args.role,
-            "pane_id": pane,
-            "tab_id": tab_id,
-            "cwd": str(work_cwd),
-            "brief": str(prompt_path),
-            "status": state,
-            "created_at": created_at,
-            "note": f"async; call `herd-dispatch collect --name {name}` later",
-            **harvested,
-        }
-        if err:
-            record["error"] = err
-        if getattr(args, "model", None):
-            record["model"] = args.model
-        return put_job(cwd, name, record, generation=generation)
-    prompt_agent(name, brief, wait=True, timeout_ms=args.timeout)
-    record = finish_sync(
-        cwd,
-        name,
-        mode="handoff",
-        kind=kind,
-        role=args.role,
-        pane=pane,
-        tab=tab_id,
-        work_cwd=work_cwd,
-        prompt_path=prompt_path,
-        lines=args.lines,
-        created_at=created_at,
-        generation=generation,
-    )
-    if getattr(args, "model", None):
-        record["model"] = args.model
-        record = put_job(cwd, name, {"model": args.model}, generation=generation)
-    return record
+    with job_lock(cwd, name):
+        # Another assign may have reserved this name while we waited for the lock.
+        if find_agent(name):
+            die(f"live agent named {name} already exists; inspect before sending a follow-up")
+        work_cwd = maybe_worktree(cwd, name, args.worktree)
+        with layout_lock(cwd):
+            placement = place_worker_pane(cwd, work_cwd, args.direction)
+            assert_not_self(placement.pane_id, name)
+            try:
+                start_agent(name, kind, placement.pane_id, extra, args.start_timeout)
+            except SystemExit:
+                rollback_placement(cwd, placement)
+                raise
+            rename_pane_quiet(placement.pane_id, name)
+        baseline = find_agent(name) or {}
+        generation = begin_generation(cwd, name)
+        brief = wrap_brief(message, cwd=work_cwd, role=args.role)
+        prompt_path = job_dir(cwd, name) / "brief.md"
+        prompt_path.write_text(brief)
+        put_job(cwd, name, {
+            "mode": mode, "kind": kind, "role": args.role, "model": args.model,
+            "pane_id": placement.pane_id, "tab_id": placement.tab_id,
+            "cwd": str(work_cwd), "brief": str(prompt_path),
+            "captain_pane_id": self_ids()["pane_id"],
+            "workspace_id": self_ids()["workspace_id"],
+            "status": status_of(baseline) or "unknown", "created_at": now_iso(),
+            "baseline_seq": baseline.get("state_change_seq"),
+        }, generation=generation)
+        record = submit_job(cwd, name, brief, sync=mode == "handoff", timeout_ms=args.timeout)
+        if mode == "handoff":
+            return finish_sync(cwd, name, mode=mode, kind=None, role=None, pane=placement.pane_id,
+                               work_cwd=work_cwd, prompt_path=None, lines=args.lines,
+                               created_at=None, generation=generation)
+        return record
 
 
 def finish_sync(
@@ -1649,22 +1630,28 @@ def finish_sync(
     created_at: str | None,
     generation: str | None,
 ) -> dict[str, Any]:
-    state = agent_status(name)
-    output = read_agent(name, lines)
-    prev = load_index(cwd).get("jobs", {}).get(name) or {}
+    prev = observe_current_job(cwd, name)
+    state = prev["status"]
+    if generation and prev.get("generation") != generation:
+        return {**prev, "ok": False, "error": "generation superseded; collect the current attempt"}
+    output = read_agent(name, lines) if state != "unknown" else ""
     if work_cwd is None and prev.get("cwd"):
         work_cwd = Path(str(prev["cwd"]))
     job = job_dir(cwd, name)
     harvested = harvest_reply(output, cwd=cwd, name=name, work_cwd=work_cwd)
     result_path = write_pane_dump(job, output, harvested.get("deliverable"))
     ok, err = verdict(state, sync=True)
+    if prev.get("delivery") != "confirmed":
+        ok, err = False, prev.get("error") or "prompt delivery unconfirmed; do not resend"
     record: dict[str, Any] = {
         "ok": ok,
         "name": name,
         "mode": mode,
         "status": state,
         "result": str(result_path),
-        "finished_at": now_iso(),
+        "finished_at": now_iso() if ok else None,
+        "deliverable": None,
+        "error": err,
         **harvested,
     }
     if kind:
@@ -1687,25 +1674,21 @@ def finish_sync(
 
 
 def wait_for_task(name: str, cwd: Path, timeout_ms: int, generation: str | None) -> str:
-    """Do not treat boot-idle as finished. Wait until this prompt works, then settles."""
-    state = agent_status(name)
-    if state == "blocked":
-        return state
-    if state == "working":
-        wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
-        return agent_status(name)
-    if state in HERDR_SETTLED:
-        wait_agent_soft(name, ["working", "blocked"], min(120000, timeout_ms))
-        state = agent_status(name)
-        if state == "working":
-            wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
-        return agent_status(name)
-    wait_agent_soft(name, ["idle", "done", "blocked", "working"], timeout_ms)
-    state = agent_status(name)
-    if state == "working":
-        wait_agent(name, ["idle", "done", "blocked"], timeout_ms)
-        return agent_status(name)
-    return state
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "unknown"
+        record = observe_current_job(cwd, name, timeout=min(5, remaining))
+        state = record["status"]
+        if record.get("generation") != generation or state in {"blocked", "unknown"}:
+            return state
+        if record["delivery"] == "rejected" or (record["delivery"] == "confirmed" and state in HERDR_SETTLED):
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return state
+        time.sleep(min(2, remaining))
 
 
 def cmd_models(args: argparse.Namespace) -> None:
@@ -1726,86 +1709,128 @@ def cmd_handoff(args: argparse.Namespace) -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     require_herdr()
     cwd = Path(args.cwd).resolve()
-    name = args.name
-    agent = find_agent(name)
-    if not agent:
-        die(f"no live agent named {name}")
-    assert_not_self(pane_of(agent), name)
-    if status_of(agent) == "blocked" and not args.force:
-        die("agent is blocked. Inspect with `herd-dispatch result` and ask the human before --force")
-    created_at = now_iso()
-    generation = begin_generation(cwd, name)
+    name = sanitize_name(args.name)
     text = resolve_message(args.message, args.message_file)
-    if args.wait:
-        prompt_agent(name, text, wait=True, timeout_ms=args.timeout)
-        record = finish_sync(
-            cwd,
-            name,
-            mode="send_message",
-            kind=None,
-            role=None,
-            pane=pane_of(agent),
-            work_cwd=None,
-            prompt_path=None,
-            lines=args.lines,
-            created_at=created_at,
-            generation=generation,
-        )
-        record["sent_at"] = created_at
+    with job_lock(cwd, name):
+        agent = find_agent(name)
+        if not agent:
+            die(f"no live agent named {name}")
+        assert_not_self(pane_of(agent), name)
+        previous = load_index(cwd).get("jobs", {}).get(name) or {}
+        if previous.get("pane_id") and previous["pane_id"] != pane_of(agent):
+            die("worker pane identity changed; inspect before sending")
+        if status_of(agent) not in {"working", "blocked", *HERDR_SETTLED}:
+            die("worker status unknown; inspect before sending")
+        if previous.get("delivery") == "unconfirmed":
+            previous = observe_job(cwd, name, previous, agent)
+            if previous.get("delivery") == "unconfirmed":
+                die("previous prompt delivery unconfirmed; watch or inspect instead of resending")
+        if status_of(agent) == "working":
+            die("worker is working; collect before sending a follow-up (Herdr does not track queued turns)")
+        if status_of(agent) == "blocked" and not args.force:
+            die("agent is blocked. Inspect with `herd-dispatch result` and ask the human before --force")
+        generation = begin_generation(cwd, name)
+        # Live cwd also repairs indexes written by older dispatchers after a send.
+        put_job(cwd, name, {
+            "mode": "send_message", "pane_id": pane_of(agent),
+            "cwd": agent.get("cwd") or previous.get("cwd") or str(cwd),
+            "kind": previous.get("kind") or agent.get("agent"),
+            "tab_id": agent.get("tab_id") or previous.get("tab_id"),
+            "captain_pane_id": previous.get("captain_pane_id") or self_ids()["pane_id"],
+            "workspace_id": previous.get("workspace_id") or self_ids()["workspace_id"],
+            "status": status_of(agent) or "unknown", "created_at": now_iso(), "sent_at": now_iso(),
+            "baseline_seq": agent.get("state_change_seq"),
+        }, generation=generation)
+        record = submit_job(cwd, name, text, sync=args.wait, timeout_ms=args.timeout)
+        if args.wait:
+            record = finish_sync(cwd, name, mode="send_message", kind=None, role=None,
+                                 pane=pane_of(agent), work_cwd=None, prompt_path=None,
+                                 lines=args.lines, created_at=None, generation=generation)
         emit(record)
-        return
-    prompt_agent(name, text, wait=False, timeout_ms=args.timeout)
-    wait_agent_soft(name, ["working", "blocked"], min(120000, args.timeout))
-    state = agent_status(name)
-    harvested = harvest_reply("", cwd=cwd, name=name)
-    ok, err = verdict(state, sync=False)
-    record = {
-        "ok": ok,
-        "name": name,
-        "mode": "send_message",
-        "status": state,
-        "sent_at": created_at,
-        "created_at": created_at,
-        **harvested,
-    }
-    if err:
-        record["error"] = err
-    put_job(cwd, name, record, generation=generation)
-    emit(record)
 
 
 def cmd_collect(args: argparse.Namespace) -> None:
     require_herdr()
     cwd = Path(args.cwd).resolve()
     name = args.name
-    agent = find_agent(name)
-    if not agent:
-        die(f"no live agent named {name}")
-    assert_not_self(pane_of(agent), name)
-    generation = expected_generation(cwd, name)
-    if args.wait:
-        wait_for_task(name, cwd, args.timeout, generation)
-    record = finish_sync(
-        cwd,
-        name,
-        mode="collect",
-        kind=None,
-        role=None,
-        pane=pane_of(agent),
-        work_cwd=None,
-        prompt_path=None,
-        lines=args.lines,
-        created_at=None,
-        generation=generation,
-    )
-    record["collected_at"] = now_iso()
-    put_job(
-        cwd,
-        name,
-        {"collected_at": record["collected_at"]},
-        generation=record.get("generation") or generation,
-    )
-    emit(record)
+    with job_lock(cwd, sanitize_name(name)):
+        agent = find_agent(name)
+        if not agent:
+            die(f"no live agent named {name}")
+        assert_not_self(pane_of(agent), name)
+        recover_job_identity(cwd, name, agent)
+        generation = expected_generation(cwd, name)
+        if args.wait:
+            wait_for_task(name, cwd, args.timeout, generation)
+        record = finish_sync(
+            cwd,
+            name,
+            mode="collect",
+            kind=None,
+            role=None,
+            pane=pane_of(agent),
+            work_cwd=None,
+            prompt_path=None,
+            lines=args.lines,
+            created_at=None,
+            generation=generation,
+        )
+        if record.get("ok"):
+            record = put_job(cwd, name, {"collected_at": now_iso()}, generation=generation)
+        emit(record)
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    require_herdr()
+    cwd = Path(args.cwd).resolve()
+    captain = self_ids()["pane_id"]
+    if not captain:
+        die("cannot resolve captain pane")
+    jobs = load_index(cwd).get("jobs", {})
+    names = args.name or [n for n, r in jobs.items() if r.get("captain_pane_id") == captain]
+    if not names:
+        die("no recorded jobs for this captain; pass --name for legacy jobs")
+    for name in names:
+        if name not in jobs:
+            die(f"no recorded job named {name}")
+        assert_not_self(jobs[name].get("pane_id"))
+    deadline = time.monotonic() + args.timeout / 1000
+    initial = {n: (jobs[n].get("status"), jobs[n].get("delivery")) for n in names}
+    while True:
+        remaining = max(0.001, deadline - time.monotonic())
+        agents, error = fleet_snapshot(min(5, remaining))
+        if error:
+            emit({"ok": False, "error": error, "jobs": [], "changed": []})
+            return
+        by_pane = {pane_of(a): a for a in agents}
+        jobs = load_index(cwd).get("jobs", {})
+        rows = []
+        changed = []
+        for name in names:
+            previous = jobs.get(name) or {}
+            agent = by_pane.get(previous.get("pane_id"))
+            if "delivery" not in previous or not previous.get("pane_id"):
+                agent = next((a for a in agents if a.get("name") == name), agent)
+                if agent:
+                    previous = recover_job_identity(cwd, name, agent)
+            record = observe_job(cwd, name, previous, agent)
+            state, delivery = record["status"], record["delivery"]
+            if (state, delivery) != initial[name]:
+                changed.append(name)
+            action = "wait"
+            if state in {"blocked", "unknown"} or delivery == "rejected":
+                action = "inspect"
+            elif state in HERDR_SETTLED and delivery == "confirmed":
+                action = "collect"
+            row = {k: record.get(k) for k in ("name", "generation", "status", "delivery", "pane_id", "cwd", "error", "state_change_seq")}
+            row["action"] = action
+            rows.append(row)
+        expired = time.monotonic() >= deadline
+        if changed or expired or any(r["action"] != "wait" for r in rows):
+            emit({"ok": True, "jobs": rows, "changed": changed, "timed_out": expired,
+                  "note": "Lifecycle only. Collect settled jobs and read their deliverables; do not resend unconfirmed prompts."})
+            return
+        time.sleep(min(args.interval / 1000, max(0, deadline - time.monotonic())))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -1820,8 +1845,8 @@ def cmd_result(args: argparse.Namespace) -> None:
     require_herdr()
     cwd = Path(args.cwd).resolve()
     name = args.name
-    path = job_dir(cwd, name) / "result.md"
     prev = load_index(cwd).get("jobs", {}).get(name) or {}
+    path = Path(prev["result"]) if prev.get("result") else job_dir(cwd, name) / "pane.md"
     work_cwd = Path(str(prev["cwd"])) if prev.get("cwd") else None
     if path.exists() and not args.refresh:
         harvested = harvest_reply(
@@ -1940,6 +1965,13 @@ def main() -> None:
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_collect)
 
+    p = sub.add_parser("watch")
+    p.add_argument("--cwd", default=os.environ.get("PWD") or os.getcwd())
+    p.add_argument("--timeout", type=int, default=30000, help="fleet watch budget ms (max 60000)")
+    p.set_defaults(func=cmd_watch)
+    p.add_argument("--name", action="append", help="job to watch; repeat, or omit for this captain's jobs")
+    p.add_argument("--interval", type=int, default=2000, help="fleet snapshot interval ms")
+
     p = sub.add_parser("status")
     p.add_argument("--name", required=True)
     p.set_defaults(func=cmd_status)
@@ -1956,6 +1988,10 @@ def main() -> None:
     p.set_defaults(func=cmd_stop)
 
     args = parser.parse_args()
+    if hasattr(args, "timeout") and args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    if args.cmd == "watch" and (args.timeout > 60000 or args.interval < 100):
+        parser.error("watch requires --timeout <= 60000 and --interval >= 100 (milliseconds)")
     args.func(args)
 
 

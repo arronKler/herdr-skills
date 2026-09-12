@@ -1,6 +1,6 @@
 # Errors and recovery
 
-All script failures are JSON on stderr with `"ok": false`.
+Precondition failures are JSON on stderr with `"ok": false`. Prompt attempts and watch results return JSON on stdout; always inspect `ok`, `delivery`, and `error`, not just the process exit code.
 
 If `doctor` itself returns `"ok": false`, stop. Show the JSON. Do not run raw `herdr agent start` / `wait` / `prompt` to work around it.
 
@@ -17,7 +17,7 @@ If `doctor` itself returns `"ok": false`, stop. Show the JSON. Do not run raw `h
 | `invalid agent name` | Name fails `[a-z][a-z0-9_-]{0,31}` | Lowercase, start with a letter |
 | `agent_not_ready` | Worker blocked during boot | `status`, read pane, ask human |
 | `agent_blocked` / `status: blocked` | Approval or question UI | Do not approve. Show `result` to the human |
-| `agent_prompt_stalled` | Still idle/done; prompt likely never started | One `send` retry. Then inspect |
+| `agent_prompt_stalled` / prompt timeout | Delivery unconfirmed; the prompt may already be running | `watch`, inspect; no automatic send or model fallback |
 | `no live agent named` | Worker exited or never started | `list`, respawn with a new name |
 | `live agent named X already exists` | assign/handoff `--name` is already live | `send --name X`. Do not invent `X-2` |
 | `agent_pane_busy` | Worker pane was not a shell yet | Script retries; if it still dies, show the human |
@@ -28,14 +28,15 @@ If `doctor` itself returns `"ok": false`, stop. Show the JSON. Do not run raw `h
 ## Herdr CLI notes
 
 - `agent start` needs an empty shell pane. The script creates or tiles a captain-owned worker tab (`--no-focus`) and waits for a prompt before start. It never splits the captain pane.
-- `agent prompt --wait` settles on `idle`, `done`, or `blocked` unless `--until` is set. Assign waits until `working` or `blocked`. Treat `blocked` as failure to finish.
-- Alternate-screen TUIs wrap and chrome-dump. Prefer `deliverable`, then `result_excerpt`. `result.md` is the TUI dump.
+- `agent prompt --wait` settles on `idle`, `done`, or `blocked` unless `--until` is set. Dispatch accepts an observed `working`, `idle`, `done`, or `blocked` transition after submission, including fast completion. Treat `blocked` as failure to finish.
+- Alternate-screen TUIs wrap and chrome-dump. Prefer `deliverable`, then `result_excerpt`. `pane.md` is the TUI dump for new collections.
 - `idle` vs `done` is a seen-tab distinction. Content-wise both mean "ready for another prompt".
-- `collect --wait` on a splash-screen `idle` waits for `working`, then for `idle`/`done`.
+- `collect --wait` waits for evidence of this prompt’s execution. Already-confirmed settled jobs return immediately; boot-idle without evidence remains unconfirmed.
+- `watch` checks the selected fleet together; use it instead of serial long waits when other jobs need supervision.
 
 ## What not to do
 
-- Do not `herdr pane send-keys enter` to poke a stuck composer unless `status` shows idle and the last prompt clearly never submitted. Prefer `send`.
+- Do not poke a stalled composer or resend merely because it is idle. `agent_prompt_stalled` is not proof of non-delivery.
 - Do not answer permission prompts.
 - Do not `herdr server stop`.
 - Do not close tabs or workspaces you did not create.

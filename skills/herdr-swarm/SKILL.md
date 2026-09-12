@@ -3,13 +3,13 @@ name: herdr-swarm
 description: Run a small agent swarm (3-8 workers) through Herdr for large tasks that one agent cannot hold in context — goal decomposition into an ownership-split task tree, merge queue with neutral arbitration, shared decision log, field guide memory, hidden benchmarks. Use when the user wants a swarm, fan-out implementation of a big spec, multi-agent build from a spec, or says swarm/蜂群. Built strictly on top of the herdr-dispatch skill.
 license: MIT
 metadata:
-  version: "0.1"
+  version: "0.2"
   runtime: herdr
 ---
 
 # Herdr Swarm
 
-Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new model economics" (Jul 2026): scalability comes from **context efficiency and coordination discipline**, not raw parallelism. This skill is the orchestration layer; it never touches `herdr` directly — all spawning, collecting, and messaging goes through the **herdr-dispatch** skill's verbs (`doctor`, `assign`, `collect`, `send`, `handoff`, `stop`).
+Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new model economics" (Jul 2026): scalability comes from **context efficiency and coordination discipline**, not raw parallelism. This skill is the orchestration layer; it never touches `herdr` directly — all spawning, collecting, and messaging goes through the **herdr-dispatch** skill's verbs (`doctor`, `assign`, `watch`, `collect`, `send`, `handoff`, `stop`).
 
 ## Preconditions
 
@@ -26,7 +26,7 @@ Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new mo
 ## Scale limits
 
 - 3–8 leaves total in the task tree. More means the captain becomes the bottleneck; split the goal into sequential swarms instead.
-- At most 10 workers `working` at once (herdr-dispatch cap). Dispatch what fits, end the turn, collect, then dispatch the next wave.
+- At most 10 workers `working` at once (herdr-dispatch cap). Dispatch what fits, supervise with `watch`, collect settled jobs, then dispatch the next wave.
 
 ## Model mix
 
@@ -61,11 +61,11 @@ Create once, at the repository root:
 
 ### 3. Dispatch wave by wave
 
-For each ready leaf: build the brief with the template, then use herdr-dispatch `assign --worktree` (async) — never `handoff` for implementation leaves; the captain must stay free to arbitrate. End the captain turn after the wave is out.
+For each ready leaf: build the brief with the template, then use herdr-dispatch `assign --worktree` (async) — never `handoff` for implementation leaves; the captain must stay free to arbitrate. After dispatch, supervise every leaf with bounded `watch` calls. A prompt stall is unconfirmed delivery, not evidence that it is safe to resend. Keep the captain active until collection and integration are handled, unless a real continuation mechanism is armed or the user pauses the task.
 
 ### 4. Collect and merge in order
 
-When collecting (herdr-dispatch `collect --wait`), process leaves one at a time through the merge queue — see [references/merge-queue.md](references/merge-queue.md). Never merge two leaves concurrently, even if they own disjoint paths: the captain must see each merge result before deciding the next step.
+Monitor all leaves together using herdr-dispatch `watch` on a 30–60s cadence. Collect each ready leaf with `collect --name` without waiting on a slower sibling. Then process collected leaves one at a time through the merge queue — see [references/merge-queue.md](references/merge-queue.md). Never merge two leaves concurrently, even if they own disjoint paths: the captain must see each merge result before deciding the next step.
 
 ### 5. Review
 

@@ -3,7 +3,7 @@ name: herdr-dispatch
 description: Dispatch peer coding agents through Herdr using assign, handoff, and send_message. Use when inside a Herdr pane and the user wants Claude, Codex, Pi, omp, Grok Build, Cursor, or another CLI worker spawned, tasked, collected, or followed up. Triggers include herd-dispatch, assign a worker, handoff to Codex, send_message to a pane, fan-out agents, peer review across CLIs, grok-build worker, cursor-agent model.
 license: MIT
 metadata:
-  version: "1.7"
+  version: "1.8"
   runtime: herdr
 ---
 
@@ -21,27 +21,32 @@ Captain protocol for running other coding CLIs as workers inside Herdr. Call the
 
 ## Tools
 
-All verbs print JSON. Read `ok`, `name`, `status`, `deliverable`, `result_excerpt`, `error`.
+All verbs print JSON. Read `ok`, `name`, `status`, `delivery`, `deliverable`, `result_excerpt`, `error`.
 
 `status` is the Herdr lifecycle: `idle`, `done`, `working`, `blocked`, or `unknown`. It is never `settled`.
 
-`ok` means this turn of conversation settled, not that the work is good:
+For dispatch/collect, `ok` describes lifecycle, not work quality:
 
-- `assign` / async `send`: `status` is `working`
-- `handoff` / `collect --wait` / `send --wait`: `status` is `idle` or `done`
+- `assign` / async `send`: delivery is confirmed and status is `working` (or `idle`/`done` if it already finished).
+- `handoff` / `collect` / `send --wait`: delivery is confirmed and status is `idle` or `done`.
+- `delivery: unconfirmed`: the prompt may already have arrived. Use `watch` or inspect; do not resend or replace the worker merely because of this result.
+- `delivery: rejected`: Herdr explicitly rejected the prompt before input was sent (currently `agent_blocked`). Inspect the gate.
 
-If `deliverable` is set, that file is the answer. `result_excerpt` is leftover pane chrome; `result.md` is the TUI dump. See [references/envelope.md](references/envelope.md).
+`watch.ok` means the fleet snapshot succeeded. Check each job's `action`, `status`, and `delivery`; it does not mean the jobs succeeded.
+
+If `deliverable` is set, that file is the answer. `result_excerpt` is leftover pane chrome; `pane.md` is the TUI dump (older jobs may use `result.md`). See [references/envelope.md](references/envelope.md).
 
 `ok: true` with `status: unknown` is a script bug. Treat it as failure.
 
-If `status` is `blocked` or `ok` is false, do not invent an approval. Show `result_excerpt` to the human.
+If `status` is `blocked`, inspect the approval/question and show it to the human. For other failures, follow the recovery instructions below; an unconfirmed delivery is not an approval request.
 
 | Verb | CAO equivalent | Blocks? | Use |
 |---|---|---|---|
-| `assign` | assign | until `working` | Fan-out independent work |
+| `assign` | assign | up to 30s to confirm prompt | Fan-out independent work |
 | `handoff` | handoff | until `idle`/`done`/`blocked` | Next step needs the worker output |
 | `send` | send_message | optional | Follow up an existing worker |
 | `collect` | inbox harvest | optional | Pull assign results later |
+| `watch` | fleet monitor | up to 30s by default | Check all jobs with one snapshot per cycle |
 | `models` | — | no | List live model ids for one `--kind` |
 
 Script path (resolve relative to this skill): `scripts/herd-dispatch`.
@@ -63,17 +68,19 @@ python3 scripts/herd-dispatch assign \
   --message-file .herd-dispatch/jobs/impl-auth/input.md
 ```
 
-Returns once the worker is `working` (not when the task is finished). Then end the captain turn and harvest later.
+Returns once prompt delivery is confirmed or the bounded confirmation window expires. Dispatch the other independent jobs, then supervise the whole wave with `watch`; collect each settled job. Continue the authorized task rather than ending the turn with only a promise to collect later.
 
 ```bash
-python3 scripts/herd-dispatch collect --name impl-auth --wait --timeout 900000
+python3 scripts/herd-dispatch watch --name impl-auth --timeout 30000
+# Repeat watch while action is wait; when action is collect:
+python3 scripts/herd-dispatch collect --name impl-auth
 ```
 
-`collect --wait` is the same kind of wait as handoff — only blocking if this captain's command tool can sit that long (see Handoff).
+Reserve `collect --wait` for a single outstanding worker. With several workers, watch all of them together so a slow job does not hide a sibling's completion or failure.
 
 Parallel assign is allowed only when tasks do not share a writable tree. Use `--worktree` for any implementation.
 
-If assign returns `idle`/`done`, the prompt never started. One `send` retry, then stop.
+`idle`/`done` alone does not prove whether input was delivered. Read `delivery`. The script persists the job before sending and reconciles late state changes without resubmitting. A fast completed job can return `ok: true` with `idle`/`done`.
 
 ## Handoff (sync)
 
@@ -85,9 +92,9 @@ python3 scripts/herd-dispatch handoff \
   --message-file .herd-dispatch/jobs/rev-auth/input.md
 ```
 
-The script waits until `idle`, `done`, or `blocked`. That wait is real only when this captain's command tool timeout is ≥ `--timeout`. Grok Build (and any captain whose shell calls background around two minutes) must not treat handoff as synchronous: `assign`, end the turn, `collect` later.
+The script waits until `idle`, `done`, or `blocked`. Use it when only one worker is outstanding and the calling tool can keep collecting its process output. If the tool returns a background/session handle, continue reading that handle; it is not job completion. For multiple workers, use `assign` plus `watch` so one slow job cannot hide another job's failure.
 
-Read `deliverable` if set, else `result_excerpt`. Pane `result.md` is a TUI dump.
+Read `deliverable` if set, else `result_excerpt`. `pane.md` is the TUI dump; older jobs may use `result.md`.
 
 ## Send message
 
@@ -98,7 +105,24 @@ python3 scripts/herd-dispatch send \
   --message "Address only the reviewer items listed below. Do not expand scope."
 ```
 
-`--wait` makes it a synchronous follow-up: just the message, then the reply. Same tool-timeout rule as Handoff. Without `--wait`, fire and `collect` later. If the worker is already `blocked`, the script refuses unless the human explicitly asked you to `--force`.
+`--wait` makes it a synchronous follow-up: just the message, then the reply. Same tool-timeout rule as Handoff. Without `--wait`, supervise with `watch`. `send` refuses a still-working worker or an unconfirmed previous prompt: Herdr does not track queued turns, so collect the current turn before following up. `--force` does not bypass these checks. If the worker is already `blocked`, the script refuses unless the human explicitly asked you to `--force`.
+
+## Supervise the whole wave
+
+```bash
+python3 "$SKILL_DIR/scripts/herd-dispatch" watch \
+  --name impl-auth --name impl-ui --name rev-api --timeout 30000
+```
+
+One read-only fleet snapshot checks every selected job each cycle. The command returns on a lifecycle/delivery change, a settled/blocked/missing worker, or the time budget. Read every row:
+
+- `action: collect`: run `collect --name <name>` without a long wait, then read the deliverable.
+- `action: inspect`: inspect `result --name <name> --refresh` and the error; handle missing workers or approval gates without replaying the task.
+- `action: wait`: keep monitoring. `delivery: unconfirmed` may still become confirmed; elapsed time alone never authorizes a resend.
+
+Omit `--name` to monitor jobs recorded for this captain in this cwd; use explicit names for the current wave or legacy jobs without captain ownership metadata. Remove handled jobs from the next watch call. `watch` does not harvest reports, merge code, send input, or approve anything. It reports Herdr lifecycle, not provider error classification or evidence of productive work; inspect a settled worker's reply even when no files changed.
+
+Keep fleet supervision on a 30–60s cadence while doing independent work. Pi can run bounded watch calls; Codex/Cursor should keep reading any background process handle returned by their command tool. Only end a turn with pending jobs when a real continuation mechanism is armed or the user asked to pause. Do not assume a future user message will restart collection. Merge serially; monitor all workers together.
 
 ## Surprise memory (field guide)
 
@@ -156,10 +180,10 @@ Do not default `--kind grok` for a worker. Grok's first prompt often never start
 
 ## Status handling
 
-- `working` after assign — normal. Do not busy-poll more than once per collect.
+- `working` after assign — normal. Use bounded fleet `watch`, not repeated per-worker polling.
 - `idle` / `done` — read `deliverable` if set, else `result_excerpt`. Script `ok` only means they finished talking.
 - `blocked` — human gate. Never send y or enter to dismiss approvals.
-- Start or prompt failure (`ok` false, still idle) — `status --name`, then one `send` retry. If still dead, `stop --name --yes` only for workers this captain created, and pick a different kind from the routing defaults instead of respawning the same one.
+- Prompt stall/timeout — read `delivery` and `prompt_error`. `unconfirmed` means watch/inspect, never an automatic retry or model fallback. Replace a worker only after concrete failure evidence and inspection of its existing output; use the user’s allowed models. The original task may already be executing.
 
 ## Cleanup
 
@@ -185,12 +209,12 @@ Never `herdr server stop`. Never close the captain pane.
 
 ## Efficiency
 
-- Dispatch every independent assign first, then end the turn, then collect.
+- Dispatch the independent wave, then watch the whole wave and collect ready jobs promptly.
 - One worker per deliverable. Do not stack nested captains.
 - Prefer `--message-file` plus `--worktree` over huge pasted context.
 - Cap live workers. If more than ten are `working`, collect or stop before spawning.
 - After collect, summarize from `deliverable` if set, else `result_excerpt`.
-- If this captain cannot wait (see Handoff), every long job is assign then later collect.
+- If a long shell call backgrounds, retain its handle and keep reading output; prefer short fleet watch calls for supervision.
 - Judge jobs by deliverables and verification results, not by activity; busywork is not progress.
 
 ## References
