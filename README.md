@@ -1,6 +1,6 @@
 # Herdr agent skills
 
-Agent skills for coordinating coding agents inside [Herdr](https://github.com/herdrdev/herdr): spawn other coding CLIs as workers, dispatch work, collect results — from one-off jobs to full agent swarms.
+Agent skills for coordinating coding agents inside [Herdr](https://github.com/herdrdev/herdr) or herdr-core (`hc`): spawn other coding CLIs as workers, dispatch work, collect results — from one-off jobs to full agent swarms.
 
 This repository holds two skills:
 
@@ -37,16 +37,19 @@ Add `--global` for a global install, or `--list` to inspect before installing.
 ## Requirements
 
 - macOS or Linux with Python 3.9 or newer. The dispatcher uses only the Python standard library.
-- [Herdr](https://github.com/herdrdev/herdr) installed and available as `herdr` on `PATH`.
-- The captain coding agent running inside a Herdr pane (`HERDR_ENV=1`, resolvable pane). `doctor` verifies this.
-- Each worker CLI installed and authenticated. Kinds depend on the local Herdr installation; examples: `claude`, `codex`, `pi`, `omp`, `grok`, `cursor`.
+- A dispatch runtime, either:
+  - [Herdr](https://github.com/herdrdev/herdr) available as `herdr` on `PATH`, with the captain running inside a Herdr pane (`HERDR_ENV=1`, resolvable pane), or
+  - herdr-core available as `hc` on `PATH` (0.1.21 or newer), with the captain running inside an hc terminal (`HC_TERMINAL_ID` set).
+
+  `doctor` reports the selected runtime as `runtime` (`herdr` or `hc`) and verifies it. Detection prefers herdr when both environments are present; set `HERD_DISPATCH_RUNTIME=herdr|hc` to force one.
+- Each worker CLI installed and authenticated. Kinds depend on the local runtime; examples: `claude`, `codex`, `pi`, `omp`, `grok`, `cursor`, `letta`, `muse`.
 - Git and a repository with an initial commit when using `--worktree`.
 
-Installing these skills does not install Herdr or worker CLIs. Grok Build uses the `grok` binary; Herdr's `cursor` kind uses `cursor-agent`, not the Cursor IDE. See [herdr-dispatch installation details](skills/herdr-dispatch/references/install.md).
+Installing these skills does not install Herdr, herdr-core, or worker CLIs. Grok Build uses the `grok` binary; the `cursor` kind uses `cursor-agent`, not the Cursor IDE. See [herdr-dispatch installation details](skills/herdr-dispatch/references/install.md).
 
 ## Use it with your agent
 
-Start your captain agent inside Herdr, then ask it to use a skill:
+Start your captain agent inside Herdr or an hc terminal, then ask it to use a skill:
 
 ```text
 Use herdr-dispatch to ask Codex to implement the parser change in a separate
@@ -69,7 +72,7 @@ SKILL_DIR="$PWD/.agents/skills/herdr-dispatch"
 python3 "$SKILL_DIR/scripts/herd-dispatch" doctor
 ```
 
-Continue only when doctor reports `"ok": true`, `"herdr": true`, and `self.pane_id`. Assign an implementation task in a separate Git worktree, collect the result, then follow up:
+Continue only when doctor reports `"ok": true`, `self.pane_id`, and a `runtime` you expect. Assign an implementation task in a separate Git worktree, collect the result, then follow up:
 
 ```bash
 python3 "$SKILL_DIR/scripts/herd-dispatch" assign \
@@ -91,7 +94,7 @@ The worker starts from the repository's `HEAD`; uncommitted changes are not copi
 
 | Command | Purpose |
 | --- | --- |
-| `doctor` | Check the captain environment and required Herdr commands |
+| `doctor` | Check the captain environment, selected runtime, and required commands |
 | `assign` | Start a worker; confirm delivery or return a recoverable unconfirmed result |
 | `handoff` | Start a worker and wait for the conversation to settle |
 | `watch` | Monitor a whole wave; return changed jobs and collect/inspect/wait actions |
@@ -99,13 +102,13 @@ The worker starts from the repository's `HEAD`; uncommitted changes are not copi
 | `send` | Send a follow-up to an existing worker; optionally wait |
 | `models --kind <kind>` | Probe supported worker CLIs for live model IDs |
 | `status --name <name>` | Inspect a worker's current lifecycle state |
-| `stop --name <name> --yes` | Close a worker pane you created |
+| `stop --name <name> --yes` | Close a worker pane (herdr) or kill a worker terminal (hc) you created |
 
 Run `python3 "$SKILL_DIR/scripts/herd-dispatch" <command> --help` for options. Timeouts are in milliseconds. `watch` defaults to 30 seconds (maximum 60); continue reading any background handle returned by the calling tool. Prompt stalls/timeouts are unconfirmed delivery, not permission to resend. Collect the current turn before `send`; it refuses working workers and unconfirmed prior prompts. See the [message and result protocol](skills/herdr-dispatch/references/envelope.md), [error recovery](skills/herdr-dispatch/references/errors.md), and the [task brief template](skills/herdr-dispatch/assets/brief-template.md).
 
 ## Where this came from
 
-herdr-swarm distills Cursor's research blog *Agent swarms and the new model economics* (July 2026) to Herdr scale: scalability comes from context efficiency and coordination discipline rather than raw parallelism, failures like split brain and merge wars need named countermeasures, and memory should live in the environment the agents share. Herdr panes are heavyweight, so this targets minute-scale swarms with single-digit concurrency — the coordination lessons transfer, Cursor's custom infrastructure does not need to.
+herdr-swarm distills Cursor's research blog *Agent swarms and the new model economics* (July 2026) to Herdr scale: scalability comes from context efficiency and coordination discipline rather than raw parallelism, failures like split brain and merge wars need named countermeasures, and memory should live in the environment the agents share. Herdr panes and hc terminals are heavyweight, so this targets minute-scale swarms with single-digit concurrency — the coordination lessons transfer, Cursor's custom infrastructure does not need to.
 
 ## Development
 
@@ -117,7 +120,7 @@ python3 skills/herdr-dispatch/scripts/herd-dispatch --help
 npx skills add . --list
 ```
 
-The unit tests use temporary directories and mocked Herdr calls. They cover result collection, lifecycle verdicts, model handling, and worker placement without launching live agents. A live dispatch check additionally requires the runtime setup above.
+The unit tests use temporary directories and mocked runtime calls (both herdr and `hc`). They cover result collection, lifecycle verdicts, model handling, worker placement, and the herdr-core backend without launching live agents. A live dispatch check additionally requires the runtime setup above.
 
 ## License
 

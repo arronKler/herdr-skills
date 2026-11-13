@@ -1,36 +1,37 @@
 ---
 name: herdr-dispatch
-description: Dispatch peer coding agents through Herdr using assign, handoff, and send_message. Use when inside a Herdr pane and the user wants Claude, Codex, Pi, omp, Grok Build, Cursor, or another CLI worker spawned, tasked, collected, or followed up. Triggers include herd-dispatch, assign a worker, handoff to Codex, send_message to a pane, fan-out agents, peer review across CLIs, grok-build worker, cursor-agent model.
+description: Dispatch peer coding agents through Herdr or herdr-core (hc) using assign, handoff, and send_message. Use when inside a Herdr pane or an hc terminal and the user wants Claude, Codex, Pi, omp, Grok Build, Cursor, or another CLI worker spawned, tasked, collected, or followed up. Triggers include herd-dispatch, assign a worker, handoff to Codex, send_message to a pane, hc run, fan-out agents, peer review across CLIs, grok-build worker, cursor-agent model.
 license: MIT
 metadata:
-  version: "1.8"
-  runtime: herdr
+  version: "1.9"
+  runtime: herdr | herdr-core
 ---
 
 # Herdr Dispatch
 
-Captain protocol for running other coding CLIs as workers inside Herdr. Call the bundled script. Do not improvise raw `herdr agent start` / `wait` / `prompt` sequences.
+Captain protocol for running other coding CLIs as workers inside Herdr or herdr-core (`hc`). Call the bundled script. Do not improvise raw `herdr agent start` / `wait` / `prompt` or `hc run` / `send` / `wait` sequences.
 
 ## Preconditions
 
-1. Run `scripts/herd-dispatch doctor` first. It must report `"ok": true`, `"herdr": true`, and `self.pane_id`.
-2. If doctor prints `"ok": false` for any reason (including `HERDR_ENV!=1`, missing verbs, or unresolved captain pane), stop. Show the JSON to the human. Do not debug by running raw `herdr agent` commands.
-3. Never target the captain pane. The script refuses self-operations; do not bypass it.
-4. Never run bare `herdr` (that attaches the TUI and hangs). Do not run bare `herdr agent` either; kinds come from doctor JSON or `herdr agent start --help`.
-5. Workers must not dispatch further workers. Only the captain uses this skill.
+1. Run `scripts/herd-dispatch doctor` first. It must report `"ok": true`, `self.pane_id`, and `runtime` (`herdr` or `hc`).
+2. The runtime is detected from the environment: `HERDR_ENV=1` selects herdr, `HC_TERMINAL_ID` selects herdr-core. Set `HERD_DISPATCH_RUNTIME=herdr|hc` to force one.
+3. herdr needs the captain in a Herdr pane; herdr-core needs the captain in an `hc` terminal (`HC_TERMINAL_ID` set). If doctor prints `"ok": false` for any reason, stop. Show the JSON to the human. Do not debug by running raw `herdr agent` or `hc` commands.
+4. Never target the captain pane or terminal. The script refuses self-operations; do not bypass it.
+5. Never run bare `herdr` (that attaches the TUI and hangs) or bare `hc` (that opens the picker). Never run `herdr server stop` or `hc server stop`.
+6. Workers must not dispatch further workers. Only the captain uses this skill.
 
 ## Tools
 
-All verbs print JSON. Read `ok`, `name`, `status`, `delivery`, `deliverable`, `result_excerpt`, `error`.
+All verbs print JSON. Read `ok`, `runtime`, `name`, `status`, `delivery`, `deliverable`, `result_excerpt`, `error`.
 
-`status` is the Herdr lifecycle: `idle`, `done`, `working`, `blocked`, or `unknown`. It is never `settled`.
+`status` is the lifecycle word: `idle`, `done`, `working`, `blocked`, or `unknown`; herdr-core can also report `error`. It is never `settled`.
 
 For dispatch/collect, `ok` describes lifecycle, not work quality:
 
 - `assign` / async `send`: delivery is confirmed and status is `working` (or `idle`/`done` if it already finished).
 - `handoff` / `collect` / `send --wait`: delivery is confirmed and status is `idle` or `done`.
 - `delivery: unconfirmed`: the prompt may already have arrived. Use `watch` or inspect; do not resend or replace the worker merely because of this result.
-- `delivery: rejected`: Herdr explicitly rejected the prompt before input was sent (currently `agent_blocked`). Inspect the gate.
+- `delivery: rejected`: the runtime explicitly rejected the prompt before input was sent (`agent_blocked` in herdr, `blocked` in herdr-core). Inspect the gate.
 
 `watch.ok` means the fleet snapshot succeeded. Check each job's `action`, `status`, and `delivery`; it does not mean the jobs succeeded.
 
@@ -105,7 +106,7 @@ python3 scripts/herd-dispatch send \
   --message "Address only the reviewer items listed below. Do not expand scope."
 ```
 
-`--wait` makes it a synchronous follow-up: just the message, then the reply. Same tool-timeout rule as Handoff. Without `--wait`, supervise with `watch`. `send` refuses a still-working worker or an unconfirmed previous prompt: Herdr does not track queued turns, so collect the current turn before following up. `--force` does not bypass these checks. If the worker is already `blocked`, the script refuses unless the human explicitly asked you to `--force`.
+`--wait` makes it a synchronous follow-up: just the message, then the reply. Same tool-timeout rule as Handoff. Without `--wait`, supervise with `watch`. `send` refuses a still-working worker or an unconfirmed previous prompt: neither runtime tracks queued turns reliably, so collect the current turn before following up. `--force` does not bypass these checks. If the worker is already `blocked`, the script refuses unless the human explicitly asked you to `--force`.
 
 ## Supervise the whole wave
 
@@ -120,7 +121,7 @@ One read-only fleet snapshot checks every selected job each cycle. The command r
 - `action: inspect`: inspect `result --name <name> --refresh` and the error; handle missing workers or approval gates without replaying the task.
 - `action: wait`: keep monitoring. `delivery: unconfirmed` may still become confirmed; elapsed time alone never authorizes a resend.
 
-Omit `--name` to monitor jobs recorded for this captain in this cwd; use explicit names for the current wave or legacy jobs without captain ownership metadata. Remove handled jobs from the next watch call. `watch` does not harvest reports, merge code, send input, or approve anything. It reports Herdr lifecycle, not provider error classification or evidence of productive work; inspect a settled worker's reply even when no files changed.
+Omit `--name` to monitor jobs recorded for this captain in this cwd; use explicit names for the current wave or legacy jobs without captain ownership metadata. Remove handled jobs from the next watch call. `watch` does not harvest reports, merge code, send input, or approve anything. It reports runtime lifecycle, not provider error classification or evidence of productive work; inspect a settled worker's reply even when no files changed.
 
 Keep fleet supervision on a 30–60s cadence while doing independent work. Pi can run bounded watch calls; Codex/Cursor should keep reading any background process handle returned by their command tool. Only end a turn with pending jobs when a real continuation mechanism is armed or the user asked to pause. Do not assume a future user message will restart collection. Merge serially; monitor all workers together.
 
@@ -182,22 +183,23 @@ Do not default `--kind grok` for a worker. Grok's first prompt often never start
 
 - `working` after assign — normal. Use bounded fleet `watch`, not repeated per-worker polling.
 - `idle` / `done` — read `deliverable` if set, else `result_excerpt`. Script `ok` only means they finished talking.
+- `error` (herdr-core) — a live agent reported an error, or a finished terminal exited non-zero. Check `state`, `exit_code`, and `reason` before deciding; do not resubmit the task blindly.
 - `blocked` — human gate. Never send y or enter to dismiss approvals.
 - Prompt stall/timeout — read `delivery` and `prompt_error`. `unconfirmed` means watch/inspect, never an automatic retry or model fallback. Replace a worker only after concrete failure evidence and inspection of its existing output; use the user’s allowed models. The original task may already be executing.
 
 ## Cleanup
 
-Leave workers up when the human may inspect panes. Stop only workers you spawned:
+Leave workers up when the human may inspect panes or terminals. Stop only workers you spawned:
 
 ```bash
 python3 scripts/herd-dispatch stop --name impl-auth --yes
 ```
 
-Never `herdr server stop`. Never close the captain pane.
+herdr closes the pane; herdr-core sends `hc kill` and leaves the finished terminal in the list. Never `herdr server stop` or `hc server stop`. Never close the captain pane or terminal.
 
 ## Placement
 
-`assign` / `handoff` never split the captain pane.
+herdr: `assign` / `handoff` never split the captain pane.
 
 - If `--name` is already a live agent, the script refuses. Use `send --name` instead of spawning a second pane.
 - The first worker in this cwd for this captain gets `tab create --workspace <captain workspace> --cwd <work> --label herd --no-focus`. The agent starts on `.result.root_pane.pane_id`.
@@ -206,6 +208,16 @@ Never `herdr server stop`. Never close the captain pane.
 - A stale pointer (tab closed, or no panes left) degrades to a new `tab create`. The script does not fall back to splitting the captain.
 - Always `--no-focus`. `pane rename` to the job name is best-effort. Failed starts close only the pane created for that attempt. Idle workers and their tabs stay up.
 - Do not steal empty shells from other captains. Reuse only panes recorded in this captain's layout entry.
+
+herdr-core: `assign` / `handoff` create a child terminal of the captain with `hc run --bg --name <job> --cwd <work>`.
+
+- There are no tabs or panes to place; herdr-core owns layout. The job address (`tN` or `machine/tN`) is stored as `pane_id` and used for every later verb (`get`, `read`, `send`, `wait`, `kill`), so a name reused by another terminal cannot redirect an existing job.
+- `--kind` names a worker CLI binary, not an `hc` template. The script resolves the binary to an absolute path before `hc run`, so native flags such as `--model` stay the program's arguments instead of becoming a template's first task.
+- If `--name` is already a live terminal, the script refuses; use `send --name`. Finished names are reusable: a new assign starts a new generation and binds the new address, while the old job keeps its old address.
+- Fleet observation uses `hc ls --all`, so a worker that exits remains observable as `done`/`error`; it does not disappear from the snapshot.
+- A failed start kills the terminal created for that attempt, so it does not leave an orphan. The script reports the error JSON instead of retrying with a different command shape.
+- `stop` sends `hc kill`; finished terminals stay listed under `hc ls --all`. `hc rm` is not run automatically.
+
 
 ## Efficiency
 

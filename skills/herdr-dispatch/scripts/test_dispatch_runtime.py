@@ -39,7 +39,7 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(hd.time, "monotonic", self.clock.now))
         self.stack.enter_context(patch.object(hd.time, "sleep", self.clock.sleep))
-        self.stack.enter_context(patch.object(hd, "require_herdr"))
+        self.stack.enter_context(patch.object(hd, "require_runtime"))
         self.stack.enter_context(patch.object(hd, "assert_not_self"))
         self.stack.enter_context(patch.object(hd, "self_ids", return_value={
             "pane_id": "captain", "workspace_id": "ws", "tab_id": "tab",
