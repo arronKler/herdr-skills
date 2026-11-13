@@ -25,6 +25,8 @@ from dispatch_store import (
 )
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+RUNTIMES = ("herdr", "hc")
+RUNTIME_ENV = "HERD_DISPATCH_RUNTIME"
 KINDS = {
     "pi",
     "claude",
@@ -47,7 +49,9 @@ KINDS = {
     "kilo",
     "qodercli",
     "qwen",
+    "letta",
     "maki",
+    "muse",
 }
 # Human / binary spellings -> herdr --kind. Grok Build is kind grok.
 KIND_ALIASES = {
@@ -77,6 +81,9 @@ MODEL_PROBES = {
     "pi": {"argv": ["--list-models"], "parser": "pi"},
 }
 HERDR_SETTLED = {"idle", "done"}
+# herdr-core reports a failed turn as `error`. It ends the turn but is never
+# reported as ok, so collection stops on it instead of waiting forever.
+ALL_SETTLED = HERDR_SETTLED | {"error"}
 TUI_PREFIX_RE = re.compile(r"^[\s│|├└┐┌┬┴┼─›•]*")
 COMPOSER_STOPS = ("\n› ", "\nAsk Codex", "\n─ Worked", "\n╭─")
 CAPTAIN_JOB_FILES = frozenset({"brief.md", "input.md", "generation", "pane.md", "submit.lock"})
@@ -107,10 +114,14 @@ def worker_note(cwd: Path, role: str) -> str:
     if role and role != "worker":
         lines.append(f"Role: {role}")
     lines.append(f"Working directory: {cwd}")
+    if runtime() == "hc":
+        ban = "Do not run `hc run`, `hc send`, `hc keys`, `herd-dispatch` "
+    else:
+        ban = "Do not run `herdr agent start`, `herdr pane split`, `herd-dispatch` "
     lines.append(
         "You are a worker, not an orchestrator. "
-        "Do not run `herdr agent start`, `herdr pane split`, `herd-dispatch`, "
-        "or spawn any peer agent. Answer in your final reply. "
+        + ban
+        + "or spawn any peer agent. Answer in your final reply. "
         "If the output is long or is a deliverable, write a file and name that path in the reply."
     )
     return "\n".join(lines) + "\n"
@@ -215,12 +226,76 @@ def herdr_json_soft(
     return parse_herdr_payload(proc)
 
 
+def hc_json(
+    args: list[str], timeout: float | None = None, quiet: bool = False
+) -> dict[str, Any]:
+    proc = run(["hc", *args, "--json"], timeout=timeout)
+    payload = parse_herdr_payload(proc)
+    if proc.returncode != 0:
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("kind") or str(err)
+        else:
+            msg = err or payload.get("raw") or f"hc {' '.join(args)} failed ({proc.returncode})"
+        die(msg, quiet=quiet)
+    return payload
+
+
+def hc_json_soft(
+    args: list[str], timeout: float | None = None
+) -> dict[str, Any] | None:
+    proc = run(["hc", *args, "--json"], timeout=timeout)
+    if proc.returncode != 0:
+        return None
+    return parse_herdr_payload(proc)
+
+
+def hc_text(args: list[str], timeout: float | None = None) -> str:
+    proc = run(["hc", *args], timeout=timeout)
+    if proc.returncode != 0:
+        die((proc.stderr or proc.stdout or f"hc {' '.join(args)} failed").strip())
+    return proc.stdout
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 
-def require_herdr() -> None:
+def runtime() -> str:
+    """Pick the captain runtime: herdr (panes/agents) or hc (herdr-core terminals).
+
+    `HERD_DISPATCH_RUNTIME=herdr|hc` forces one. Otherwise the process
+    environment decides: HERDR_ENV=1 means herdr, HC_TERMINAL_ID means hc.
+    A herdr pane wins when both leak in, because herdr is the older runtime
+    and its env vars are inherited by every child process.
+    """
+    forced = os.environ.get(RUNTIME_ENV, "").strip().lower()
+    if forced in RUNTIMES:
+        return forced
+    if forced:
+        die(f"invalid {RUNTIME_ENV}='{forced}'. Use herdr or hc.")
+    if os.environ.get("HERDR_ENV") == "1" and shutil.which("herdr"):
+        return "herdr"
+    if os.environ.get("HC_TERMINAL_ID") and shutil.which("hc"):
+        return "hc"
+    if os.environ.get("HERDR_ENV") == "1":
+        return "herdr"
+    if os.environ.get("HC_TERMINAL_ID"):
+        return "hc"
+    return "herdr"
+
+
+def require_runtime() -> None:
+    if runtime() == "hc":
+        if shutil.which("hc") is None:
+            die("hc is not on PATH. Install herdr-core, or set HERD_DISPATCH_RUNTIME=herdr.")
+        if not os.environ.get("HC_TERMINAL_ID"):
+            die(
+                "not inside a herdr-core terminal (HC_TERMINAL_ID unset). "
+                "Start the captain in an hc terminal, or set HERD_DISPATCH_RUNTIME=herdr."
+            )
+        return
     if shutil.which("herdr") is None:
         die("herdr is not on PATH")
     if os.environ.get("HERDR_ENV") != "1":
@@ -228,13 +303,76 @@ def require_herdr() -> None:
 
 
 def self_ids() -> dict[str, str]:
+    if runtime() == "hc":
+        terminal = os.environ.get("HC_TERMINAL_ID") or ""
+        return {
+            "pane_id": terminal,
+            "terminal_id": terminal,
+            "workspace_id": "",
+            "tab_id": "",
+        }
     pane = os.environ.get("HERDR_PANE_ID") or ""
     workspace = os.environ.get("HERDR_WORKSPACE_ID") or ""
     tab = os.environ.get("HERDR_TAB_ID") or ""
     return {"pane_id": pane, "workspace_id": workspace, "tab_id": tab}
 
 
+def hc_terminals() -> list[dict[str, Any]]:
+    payload = hc_json_soft(["ls"])
+    if not payload:
+        return []
+    terminals = payload.get("terminals")
+    return terminals if isinstance(terminals, list) else []
+
+
+def hc_view(
+    term: dict[str, Any], full: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Normalize a herdr-core terminal into the dispatch agent shape."""
+    data = dict(term or {})
+    if isinstance(full, dict):
+        for key, value in full.items():
+            if value is not None or key not in data:
+                data[key] = value
+    status = data.get("status")
+    state = ""
+    if isinstance(status, dict):
+        state = str(status.get("state") or "")
+    elif isinstance(status, str):
+        state = status
+    if not state:
+        if data.get("state") == "finished":
+            state = "done" if data.get("exit_code") == 0 else "error"
+        else:
+            state = "unknown"
+    if state == "blocked" and isinstance(status, dict) and status.get("msg"):
+        state = "blocked"
+    address = str(data.get("address") or data.get("terminal") or "")
+    foreground = data.get("foreground") if isinstance(data.get("foreground"), dict) else {}
+    return {
+        "name": data.get("name"),
+        "agent_name": data.get("name"),
+        "pane_id": address,
+        "address": address,
+        "agent": data.get("agent") or data.get("template"),
+        "agent_status": state,
+        "cwd": data.get("cwd") or foreground.get("cwd"),
+        "turn": data.get("turn"),
+        "state": data.get("state"),
+        "exit_code": data.get("exit_code"),
+        "reason": data.get("reason"),
+        "raw": data,
+    }
+
+
 def agent_list(timeout: float | None = None) -> list[dict[str, Any]]:
+    if runtime() == "hc":
+        views: list[dict[str, Any]] = []
+        for term in hc_terminals():
+            address = term.get("address")
+            full = hc_json_soft(["get", str(address)], timeout=timeout) if address else None
+            views.append(hc_view(term, full))
+        return views
     payload = herdr_json(["agent", "list"], timeout=timeout)
     result = payload.get("result", payload)
     if isinstance(result, list):
@@ -247,6 +385,14 @@ def agent_list(timeout: float | None = None) -> list[dict[str, Any]]:
 
 
 def find_agent(name: str) -> dict[str, Any] | None:
+    if runtime() == "hc":
+        payload = hc_json_soft(["get", str(name)])
+        if payload:
+            return hc_view(payload)
+        for term in hc_terminals():
+            if term.get("name") == name or term.get("address") == name:
+                return hc_view(term)
+        return None
     for item in agent_list():
         if item.get("name") == name or item.get("agent_name") == name:
             return item
@@ -704,6 +850,12 @@ def rollback_placement(cwd: Path, placement: Placement | None) -> None:
 
 def place_worker_pane(cwd: Path, work_cwd: Path, direction: str) -> Placement:
     """Put a new worker on a captain-owned tab. Never split the captain pane."""
+    if runtime() == "hc":
+        # herdr-core has no layout: every worker is its own terminal, owned by
+        # the captain through HC_TERMINAL_ID. Nothing to place or reclaim.
+        return Placement(
+            pane_id="", tab_id="", created_pane=False, created_tab=False
+        )
     me = self_ids()
     captain = me["pane_id"]
     if not captain:
@@ -815,7 +967,63 @@ def wait_for_shell(pane: str, timeout_ms: int = 15000) -> None:
     die(f"pane {pane} did not become an interactive shell: {last[-300:]}")
 
 
-def start_agent(name: str, kind: str, pane: str, extra: list[str], timeout_ms: int) -> dict[str, Any]:
+def hc_wait_ready(name: str, timeout_ms: int) -> dict[str, Any]:
+    """Block until a freshly started herdr-core agent stops booting."""
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            die(f"worker {name} did not become ready within {timeout_ms}ms")
+        seconds = max(1, min(180, int(remaining)))
+        payload = hc_json_soft(["wait", name, "--timeout", str(seconds)])
+        if payload is None:
+            die(f"worker {name} disappeared while starting")
+        error = payload.get("error")
+        if isinstance(error, dict):
+            die(error.get("message") or error.get("kind") or f"worker {name} failed to start")
+        reason = str(payload.get("reason") or "")
+        status = str(payload.get("status") or "")
+        if reason == "timeout":
+            continue  # a check-in, not a failure
+        if reason == "exit":
+            die(f"worker {name} exited before it was ready (exit {payload.get('exit_code')})")
+        if status in {"idle", "done", "blocked"}:
+            return payload
+        if payload.get("ended"):
+            return payload
+
+
+def start_agent_hc(
+    name: str, kind: str, work_cwd: Path, extra: list[str], timeout_ms: int
+) -> dict[str, Any]:
+    argv = [
+        "hc", "run", "--bg", "--json",
+        "--name", name, "--cwd", str(work_cwd), kind, *extra,
+    ]
+    proc = run(argv, timeout=timeout_ms / 1000 + 15)
+    payload = parse_herdr_payload(proc)
+    if proc.returncode != 0:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            die(error.get("message") or error.get("kind") or str(error))
+        die(payload.get("raw") or f"hc run failed ({proc.returncode})")
+    hc_wait_ready(name, timeout_ms)
+    agent = find_agent(name) or hc_view(payload)
+    return {"result": {"agent": agent}, "raw": payload}
+
+
+def start_agent(
+    name: str,
+    kind: str,
+    pane: str,
+    extra: list[str],
+    timeout_ms: int,
+    work_cwd: Path | None = None,
+) -> dict[str, Any]:
+    if runtime() == "hc":
+        if work_cwd is None:
+            die("internal: herdr-core start requires a working directory")
+        return start_agent_hc(name, kind, work_cwd, extra, timeout_ms)
     wait_for_shell(pane)
     args = [
         "agent",
@@ -867,13 +1075,57 @@ def wait_agent(name: str, until: list[str], timeout_ms: int) -> dict[str, Any]:
     return herdr_json(args, timeout=timeout_ms / 1000 + 5)
 
 
+def prompt_agent_hc(
+    name: str, text: str, *, force: bool, timeout_ms: int
+) -> dict[str, Any]:
+    argv = ["hc", "send", "--json"]
+    if force:
+        argv.append("--force")
+    argv.extend([name, text])
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=max(0.001, timeout_ms / 1000) + 5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # The paste may already have happened; never replay it here.
+        return {
+            "ok": False,
+            "error": {"code": "prompt_transport_unknown", "message": str(exc)},
+        }
+    payload = parse_herdr_payload(proc)
+    error = payload.get("error")
+    if proc.returncode != 0 or error:
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("kind") or error)
+        else:
+            message = str(error or payload.get("raw") or f"hc send failed ({proc.returncode})")
+        code = "agent_blocked" if "blocked" in message.lower() else "prompt_failed"
+        return {"ok": False, "error": {"code": code, "message": message}}
+    # `started` is null for programs that do not report status and may lag the
+    # actual turn; observe_job reconciles a late confirmation from `turn`.
+    if payload.get("started") is True:
+        return {"ok": True, "response": payload}
+    return {
+        "ok": False,
+        "error": {
+            "code": "delivery_unconfirmed",
+            "message": "hc did not observe the agent start working",
+        },
+        "response": payload,
+    }
+
+
 def prompt_agent(
     name: str,
     text: str,
     wait: bool,
     timeout_ms: int,
     until: list[str] | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
+    if runtime() == "hc":
+        return prompt_agent_hc(name, text, force=force, timeout_ms=timeout_ms)
     args = ["agent", "prompt", name, text]
     if wait:
         args.extend(["--wait", "--timeout", str(timeout_ms)])
@@ -897,6 +1149,8 @@ def prompt_agent(
 
 
 def read_agent(name: str, lines: int = 400) -> str:
+    if runtime() == "hc":
+        return hc_text(["read", str(name), "--lines", str(max(0, lines))])
     return herdr_text(
         ["agent", "read", name, "--source", "recent-unwrapped", "--lines", str(lines)]
     )
@@ -1091,6 +1345,8 @@ def verdict(herdr_status: str, *, sync: bool) -> tuple[bool, str | None]:
     """ok means this turn settled. The reply is in result_excerpt, not a grade."""
     if herdr_status == "blocked":
         return False, "worker is blocked on an approval or question. Inspect result and ask the human."
+    if herdr_status == "error":
+        return False, "worker reported an error. Inspect result; do not resend blindly."
     if not sync:
         if herdr_status == "working":
             return True, None
@@ -1122,8 +1378,16 @@ REQUIRED_VERBS = (
 )
 
 
+HC_REQUIRED_VERBS = ("run", "ls", "get", "send", "wait", "read", "kill")
+
+
 def probe_verbs() -> dict[str, bool]:
     found: dict[str, bool] = {}
+    if runtime() == "hc":
+        for verb in HC_REQUIRED_VERBS:
+            proc = run(["hc", verb, "--help"])
+            found[verb] = proc.returncode == 0
+        return found
     for verb in REQUIRED_VERBS:
         proc = run(["herdr", *verb, "--help"])
         found[" ".join(verb)] = proc.returncode == 0
@@ -1142,6 +1406,10 @@ def _parse_kinds(text: str) -> set[str]:
 
 
 def known_kinds() -> set[str]:
+    if runtime() == "hc":
+        # herdr-core starts any interactive program; `kind` is that program's
+        # name and the shared kinds list is the vocabulary this skill documents.
+        return set(KINDS)
     # Prefer `agent start --help` (rc 0). Fall back to `herdr agent` usage (rc 2, still has kinds:).
     proc = run(["herdr", "agent", "start", "--help"])
     parsed = _parse_kinds((proc.stdout or "") + (proc.stderr or ""))
@@ -1416,9 +1684,15 @@ def probe_models(kind: str, *, timeout: float = 30.0) -> dict[str, Any]:
 
 
 def cmd_doctor(_args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
+    rt = runtime()
     me = self_ids()
     if not me["pane_id"]:
+        if rt == "hc":
+            die(
+                "cannot resolve captain terminal (HC_TERMINAL_ID unset). "
+                "Refusing to run without self-protection."
+            )
         die(
             "cannot resolve captain pane (HERDR_PANE_ID unset). "
             "Refusing to run without self-protection."
@@ -1428,25 +1702,34 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     agents = agent_list()
     captain = next((a for a in agents if pane_of(a) == me["pane_id"]), None)
     healthy = not missing and captain is not None
-    emit(
-        {
-            "ok": healthy,
-            "herdr": True,
-            "self": me,
-            "captain_agent": captain.get("agent") if captain else None,
-            "captain_status": status_of(captain) if captain else None,
-            "agent_count": len(agents),
-            "verbs": verbs,
-            "kinds": sorted(known_kinds()),
-            "model_kinds": sorted(MODEL_PROBES),
+    payload: dict[str, Any] = {
+        "ok": healthy,
+        "runtime": rt,
+        "herdr": rt == "herdr",
+        "self": me,
+        "captain_agent": captain.get("agent") if captain else None,
+        "captain_status": status_of(captain) if captain else None,
+        "agent_count": len(agents),
+        "verbs": verbs,
+        "kinds": sorted(known_kinds()),
+        "model_kinds": sorted(MODEL_PROBES),
+    }
+    if rt == "hc":
+        status = hc_json_soft(["server", "status"]) or {}
+        core = status.get("core") if isinstance(status.get("core"), dict) else {}
+        payload["hc"] = {
+            "terminal_id": me["pane_id"],
+            "version": status.get("version"),
+            "core": core.get("name"),
+            "live_terminals": status.get("live"),
         }
-    )
+    emit(payload)
     if not healthy:
         raise SystemExit(1)
 
 
 def cmd_whoami(_args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     me = self_ids()
     match = None
     for agent in agent_list():
@@ -1457,7 +1740,7 @@ def cmd_whoami(_args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     emit({"ok": True, "agents": agent_list(), "jobs": load_index(cwd).get("jobs", {})})
 
@@ -1470,17 +1753,23 @@ def observe_job(
                and (not agent.get("name") or agent["name"] == name))
     state = (status_of(agent) or "unknown") if matched else "unknown"
     delivery = record.get("delivery", "unconfirmed")
-    sequence = agent.get("state_change_seq") if matched else None
+    sequence = (
+        agent.get("state_change_seq") if matched else None
+    )
+    if sequence is None and matched:
+        sequence = agent.get("turn")
     baseline = record.get("baseline_seq")
     advanced = isinstance(sequence, int) and isinstance(baseline, int) and sequence > baseline
     if delivery == "unconfirmed" and matched and (
-        state == "working" or (advanced and state in HERDR_SETTLED)
+        state == "working" or (advanced and state in ALL_SETTLED)
     ):
         delivery = "confirmed"
     ok = delivery == "confirmed" and state in {"working", *HERDR_SETTLED}
     error = None
     if not matched:
         error = "worker missing or pane identity changed; inspect before replacing"
+    elif state == "error":
+        error = "worker reported an error; inspect the result"
     elif state == "blocked":
         error = "worker blocked; inspect the approval or question"
     elif delivery == "rejected":
@@ -1495,8 +1784,45 @@ def observe_job(
     }, generation=record.get("generation"))
 
 
+def hc_fleet_snapshot(timeout: float) -> tuple[list[dict[str, Any]], str | None]:
+    """Bounded, read-only probe; a transport failure is not an empty fleet."""
+    budget = max(0.001, timeout)
+    try:
+        proc = subprocess.run(
+            ["hc", "ls", "--json"], capture_output=True, text=True, timeout=budget
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"fleet observation unavailable: {exc}"
+    payload = parse_herdr_payload(proc)
+    if proc.returncode != 0 or payload.get("error"):
+        return [], f"fleet observation unavailable: {payload}"
+    terminals = payload.get("terminals")
+    if not isinstance(terminals, list):
+        return [], "fleet observation unavailable: hc ls returned no terminals"
+    views: list[dict[str, Any]] = []
+    for term in terminals:
+        if not isinstance(term, dict):
+            continue
+        address = term.get("address")
+        full = None
+        if address:
+            try:
+                probe = subprocess.run(
+                    ["hc", "get", str(address), "--json"],
+                    capture_output=True, text=True, timeout=min(budget, 5),
+                )
+                if probe.returncode == 0:
+                    full = parse_herdr_payload(probe)
+            except (OSError, subprocess.TimeoutExpired):
+                full = None
+        views.append(hc_view(term, full))
+    return views, None
+
+
 def fleet_snapshot(timeout: float) -> tuple[list[dict[str, Any]], str | None]:
     """Bounded, read-only probe; a transport failure is not an empty fleet."""
+    if runtime() == "hc":
+        return hc_fleet_snapshot(timeout)
     try:
         proc = subprocess.run(["herdr", "agent", "list"], capture_output=True,
                               text=True, timeout=max(0.001, timeout))
@@ -1538,13 +1864,21 @@ def observe_current_job(cwd: Path, name: str, timeout: float = 5) -> dict[str, A
     return observe_job(cwd, name, record, agent)
 
 
-def submit_job(cwd: Path, name: str, text: str, *, sync: bool, timeout_ms: int) -> dict[str, Any]:
+def submit_job(
+    cwd: Path,
+    name: str,
+    text: str,
+    *,
+    sync: bool,
+    timeout_ms: int,
+    force: bool = False,
+) -> dict[str, Any]:
     # Caller persisted identity and a baseline under the submit lock before entry.
     budget = timeout_ms if sync else min(timeout_ms, 30000)
     deadline = time.monotonic() + budget / 1000
     response = prompt_agent(
         name, text, wait=True, timeout_ms=min(budget, 10000),
-        until=["working", "idle", "done", "blocked"],
+        until=["working", "idle", "done", "blocked"], force=force,
     )
     record = load_index(cwd)["jobs"][name]
     error = response.get("error")
@@ -1558,9 +1892,9 @@ def submit_job(cwd: Path, name: str, text: str, *, sync: bool, timeout_ms: int) 
         if remaining <= 0:
             return record
         record = observe_current_job(cwd, name, timeout=min(5, remaining))
-        if record["status"] in {"blocked", "unknown"} or record["delivery"] == "rejected":
+        if record["status"] in {"blocked", "error", "unknown"} or record["delivery"] == "rejected":
             return record
-        if record["delivery"] == "confirmed" and (not sync or record["status"] in HERDR_SETTLED):
+        if record["delivery"] == "confirmed" and (not sync or record["status"] in ALL_SETTLED):
             return record
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1569,11 +1903,13 @@ def submit_job(cwd: Path, name: str, text: str, *, sync: bool, timeout_ms: int) 
 
 
 def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     kind = resolve_kind(args.kind)
     kinds = known_kinds()
-    if kind not in kinds:
+    if kind not in kinds and not (
+        runtime() == "hc" and shutil.which(kind_binary(kind))
+    ):
         die(f"unknown kind '{kind}'. known: {', '.join(sorted(kinds))}")
     name = resolve_spawn_name(args.name, args.role, kind)
     assert_not_self(None, name)
@@ -1588,12 +1924,21 @@ def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
             placement = place_worker_pane(cwd, work_cwd, args.direction)
             assert_not_self(placement.pane_id, name)
             try:
-                start_agent(name, kind, placement.pane_id, extra, args.start_timeout)
+                start_agent(
+                    name, kind, placement.pane_id, extra, args.start_timeout, work_cwd
+                )
             except SystemExit:
                 rollback_placement(cwd, placement)
                 raise
             rename_pane_quiet(placement.pane_id, name)
         baseline = find_agent(name) or {}
+        if runtime() == "hc" and not placement.pane_id:
+            placement = Placement(
+                pane_id=pane_of(baseline),
+                tab_id="",
+                created_pane=False,
+                created_tab=False,
+            )
         generation = begin_generation(cwd, name)
         brief = wrap_brief(message, cwd=work_cwd, role=args.role)
         prompt_path = job_dir(cwd, name) / "brief.md"
@@ -1604,8 +1949,9 @@ def spawn(args: argparse.Namespace, mode: str) -> dict[str, Any]:
             "cwd": str(work_cwd), "brief": str(prompt_path),
             "captain_pane_id": self_ids()["pane_id"],
             "workspace_id": self_ids()["workspace_id"],
+            "runtime": runtime(),
             "status": status_of(baseline) or "unknown", "created_at": now_iso(),
-            "baseline_seq": baseline.get("state_change_seq"),
+            "baseline_seq": baseline.get("state_change_seq") or baseline.get("turn"),
         }, generation=generation)
         record = submit_job(cwd, name, brief, sync=mode == "handoff", timeout_ms=args.timeout)
         if mode == "handoff":
@@ -1681,7 +2027,7 @@ def wait_for_task(name: str, cwd: Path, timeout_ms: int, generation: str | None)
             return "unknown"
         record = observe_current_job(cwd, name, timeout=min(5, remaining))
         state = record["status"]
-        if record.get("generation") != generation or state in {"blocked", "unknown"}:
+        if record.get("generation") != generation or state in {"blocked", "error", "unknown"}:
             return state
         if record["delivery"] == "rejected" or (record["delivery"] == "confirmed" and state in HERDR_SETTLED):
             return state
@@ -1707,7 +2053,7 @@ def cmd_handoff(args: argparse.Namespace) -> None:
 
 
 def cmd_send(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     name = sanitize_name(args.name)
     text = resolve_message(args.message, args.message_file)
@@ -1719,29 +2065,34 @@ def cmd_send(args: argparse.Namespace) -> None:
         previous = load_index(cwd).get("jobs", {}).get(name) or {}
         if previous.get("pane_id") and previous["pane_id"] != pane_of(agent):
             die("worker pane identity changed; inspect before sending")
-        if status_of(agent) not in {"working", "blocked", *HERDR_SETTLED}:
+        if agent.get("state") == "finished":
+            die(f"terminal {pane_of(agent)} has finished; spawn a new worker instead")
+        if status_of(agent) not in {"working", "blocked", *ALL_SETTLED}:
             die("worker status unknown; inspect before sending")
         if previous.get("delivery") == "unconfirmed":
             previous = observe_job(cwd, name, previous, agent)
             if previous.get("delivery") == "unconfirmed":
                 die("previous prompt delivery unconfirmed; watch or inspect instead of resending")
         if status_of(agent) == "working":
-            die("worker is working; collect before sending a follow-up (Herdr does not track queued turns)")
+            die("worker is working; collect before sending a follow-up (the current turn owns the worker)")
         if status_of(agent) == "blocked" and not args.force:
             die("agent is blocked. Inspect with `herd-dispatch result` and ask the human before --force")
         generation = begin_generation(cwd, name)
         # Live cwd also repairs indexes written by older dispatchers after a send.
         put_job(cwd, name, {
             "mode": "send_message", "pane_id": pane_of(agent),
+            "runtime": runtime(),
             "cwd": agent.get("cwd") or previous.get("cwd") or str(cwd),
             "kind": previous.get("kind") or agent.get("agent"),
             "tab_id": agent.get("tab_id") or previous.get("tab_id"),
             "captain_pane_id": previous.get("captain_pane_id") or self_ids()["pane_id"],
             "workspace_id": previous.get("workspace_id") or self_ids()["workspace_id"],
             "status": status_of(agent) or "unknown", "created_at": now_iso(), "sent_at": now_iso(),
-            "baseline_seq": agent.get("state_change_seq"),
+            "baseline_seq": agent.get("state_change_seq") or agent.get("turn"),
         }, generation=generation)
-        record = submit_job(cwd, name, text, sync=args.wait, timeout_ms=args.timeout)
+        record = submit_job(
+            cwd, name, text, sync=args.wait, timeout_ms=args.timeout, force=args.force
+        )
         if args.wait:
             record = finish_sync(cwd, name, mode="send_message", kind=None, role=None,
                                  pane=pane_of(agent), work_cwd=None, prompt_path=None,
@@ -1750,7 +2101,7 @@ def cmd_send(args: argparse.Namespace) -> None:
 
 
 def cmd_collect(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     name = args.name
     with job_lock(cwd, sanitize_name(name)):
@@ -1781,7 +2132,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     captain = self_ids()["pane_id"]
     if not captain:
@@ -1818,7 +2169,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if (state, delivery) != initial[name]:
                 changed.append(name)
             action = "wait"
-            if state in {"blocked", "unknown"} or delivery == "rejected":
+            if state in {"blocked", "error", "unknown"} or delivery == "rejected":
                 action = "inspect"
             elif state in HERDR_SETTLED and delivery == "confirmed":
                 action = "collect"
@@ -1834,7 +2185,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     agent = find_agent(args.name)
     if not agent:
         die(f"no live agent named {args.name}")
@@ -1842,7 +2193,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_result(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     cwd = Path(args.cwd).resolve()
     name = args.name
     prev = load_index(cwd).get("jobs", {}).get(name) or {}
@@ -1881,15 +2232,18 @@ def cmd_result(args: argparse.Namespace) -> None:
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    require_herdr()
+    require_runtime()
     agent = find_agent(args.name)
     if not agent:
         die(f"no live agent named {args.name}")
     pane = pane_of(agent)
     assert_not_self(pane, args.name)
     if not args.yes:
-        die("refusing to close a pane without --yes")
-    herdr_json(["pane", "close", pane])
+        die("refusing to stop a worker without --yes")
+    if runtime() == "hc":
+        hc_json(["kill", str(pane)])
+    else:
+        herdr_json(["pane", "close", pane])
     emit({"ok": True, "stopped": args.name, "pane_id": pane})
 
 

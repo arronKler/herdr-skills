@@ -1,19 +1,19 @@
 ---
 name: herdr-swarm
-description: Run a small agent swarm (3-8 workers) through Herdr for large tasks that one agent cannot hold in context — goal decomposition into an ownership-split task tree, merge queue with neutral arbitration, shared decision log, field guide memory, hidden benchmarks. Use when the user wants a swarm, fan-out implementation of a big spec, multi-agent build from a spec, or says swarm/蜂群. Built strictly on top of the herdr-dispatch skill.
+description: Run a small agent swarm (3-8 workers) through Herdr or herdr-core for large tasks that one agent cannot hold in context — goal decomposition into an ownership-split task tree, merge queue with neutral arbitration, shared decision log, field guide memory, hidden benchmarks. Use when the user wants a swarm, fan-out implementation of a big spec, multi-agent build from a spec, or says swarm/蜂群. Built strictly on top of the herdr-dispatch skill.
 license: MIT
 metadata:
-  version: "0.2"
-  runtime: herdr
+  version: "0.3"
+  runtime: herdr | herdr-core
 ---
 
 # Herdr Swarm
 
-Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new model economics" (Jul 2026): scalability comes from **context efficiency and coordination discipline**, not raw parallelism. This skill is the orchestration layer; it never touches `herdr` directly — all spawning, collecting, and messaging goes through the **herdr-dispatch** skill's verbs (`doctor`, `assign`, `watch`, `collect`, `send`, `handoff`, `stop`).
+Small-scale swarm protocol, distilled from Cursor's "Agent swarms and the new model economics" (Jul 2026): scalability comes from **context efficiency and coordination discipline**, not raw parallelism. This skill is the orchestration layer; it never touches `herdr` or `hc` directly — all spawning, collecting, and messaging goes through the **herdr-dispatch** skill's verbs (`doctor`, `assign`, `watch`, `collect`, `send`, `handoff`, `stop`).
 
 ## Preconditions
 
-1. herdr-dispatch must be installed and its `doctor` must pass. If not, stop and tell the human.
+1. herdr-dispatch must be installed and its `doctor` must pass under whichever runtime the captain is in (herdr or herdr-core). If not, stop and tell the human.
 2. The task must be big enough that one agent would lose context: multiple modules, a full spec, hours of work. For a single-file fix, use herdr-dispatch directly instead.
 3. `--worktree` isolation is mandatory for every implementation leaf. Read-only leaves may share the main tree.
 
@@ -93,7 +93,7 @@ If the task has an evaluable ground truth, hold out the eval suite: never mentio
 
 ## Hard rules
 
-- All dispatch goes through herdr-dispatch verbs. No raw `herdr` commands.
+- All dispatch goes through herdr-dispatch verbs. No raw `herdr` or `hc` commands.
 - The captain never implements and never delegates a design decision.
 - No two concurrent leaves share writable paths.
 - No concurrent merges. No merges without a prior collect.
