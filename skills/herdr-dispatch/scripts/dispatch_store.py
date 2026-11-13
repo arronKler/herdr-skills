@@ -98,6 +98,27 @@ def expected_generation(cwd: Path, name: str) -> str | None:
     return (path.read_text().strip() or None) if path.exists() else None
 
 
+def next_observation_seq(cwd: Path) -> int:
+    """A store-wide sequence for snapshots, taken when the snapshot is read.
+
+    hc's `turn` only advances when an agent leaves `working`, so it cannot
+    order observations (idle -> working keeps the same turn). Allocating this
+    before the read lets put_job reject a snapshot superseded by a newer one.
+    """
+    with index_lock(cwd):
+        index = load_index(cwd)
+        seq = int(index.get("observation_seq") or 0)
+        # Records written before this counter existed used hc's turn here.
+        for job in (index.get("jobs") or {}).values():
+            old = job.get("state_change_seq") if isinstance(job, dict) else None
+            if isinstance(old, int):
+                seq = max(seq, old)
+        seq += 1
+        index["observation_seq"] = seq
+        save_index(cwd, index)
+        return seq
+
+
 def put_job(
     cwd: Path, name: str, record: dict[str, Any], *, generation: str | None
 ) -> dict[str, Any]:

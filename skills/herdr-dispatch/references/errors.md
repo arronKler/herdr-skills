@@ -21,12 +21,13 @@ If `doctor` itself returns `"ok": false`, stop. Show the JSON. Do not run raw `h
 | `invalid agent name` | Name fails `[a-z][a-z0-9_-]{0,31}` | Lowercase, start with a letter |
 | `agent_not_ready` | Worker blocked during boot | `status`, read pane, ask human |
 | `agent_blocked` / `status: blocked` | Approval or question UI | Do not approve. Show `result` to the human |
-| `status: error` | herdr-core terminal exited non-zero | Read the reply/dump; decide before respawning |
+| `status: error` | A live herdr-core agent reported an error, or a finished terminal exited non-zero | Check `state`/`exit_code`; read the reply/dump, then decide before respawning |
 | `delivery_unconfirmed` | herdr-core `send` returned no `started` confirmation | `watch`, inspect; do not resend |
+| `status_mismatch` | `hc send --if idle` found the worker no longer idle | Nothing was typed. Inspect the current turn; do not blindly resend |
 | `prompt_transport_unknown` | `hc send` timed out | Same rule: the prompt may be running |
 | `hc error kind=...` | herdr-core rejected the call (`not_found`, `blocked`, `invalid`, `refused`, ...) | Show `message`/`hint`; re-read `hc schema` if a flag was rejected |
 | `agent_prompt_stalled` / prompt timeout | Delivery unconfirmed; the prompt may already be running | `watch`, inspect; no automatic send or model fallback |
-| `no live agent named` | Worker exited or never started | `list`, respawn with a new name |
+| `no terminal found for job` | Recorded terminal was removed or never existed | `list`, respawn with a new name |
 | `live agent named X already exists` | assign/handoff `--name` is already live | `send --name X`. Do not invent `X-2` |
 | `agent_pane_busy` | Worker pane was not a shell yet | Script retries; if it still dies, show the human |
 | `tab create returned no tab/root pane` | Herdr layout error | Show the JSON. Do not `pane split --current` on the captain |
@@ -44,10 +45,10 @@ If `doctor` itself returns `"ok": false`, stop. Show the JSON. Do not run raw `h
 
 ## herdr-core CLI notes
 
-- Workers are terminals, addressed `tN` (or `machine/tN` across machines). The script stores that address as `pane_id`.
-- Status comes from the agent's OSC 7501 reports. A live terminal with no report yet is `unknown`; a finished terminal maps `exit_code == 0` to `done`, anything else to `error`.
-- `hc run --bg` returns before the child CLI is ready. The script then polls `hc wait` until a status report or the start timeout.
-- `hc send` reports `started` for the turn it delivered. `started: null` is not proof of non-delivery; treat it as `delivery_unconfirmed`.
+- Workers are terminals, addressed `tN` (or `machine/tN` across machines). The script stores that address as `pane_id` and uses it, not the name, for all later operations.
+- Status comes from the agent's OSC 7501 reports. A live terminal with no report yet is `unknown`; a live `error` is a program-reported state; a finished terminal maps `exit_code == 0` to `done`, anything else to `error`. `hc ls --all` keeps finished terminals in fleet snapshots.
+- `hc run --bg` returns before the child CLI is ready. The script then polls `hc wait` until a status report or the start timeout, and kills the terminal if the start fails.
+- `hc send` reports `started` for the turn it delivered. An idle follow-up also passes `--if idle`, so a concurrent status change rejects it with `status_mismatch` instead of typing into the wrong turn. `started: null` is not proof of non-delivery; treat it as `delivery_unconfirmed`.
 - `hc kill` finishes the terminal; `hc rm` deletes it. The script only kills (`stop --yes`).
 - Do not run `hc` bare (picker) or `hc server stop`.
 - Errors arrive as `{"error":{"kind","message","hint"}}` with a non-zero exit. Show the hint; do not retry with guessed flags.

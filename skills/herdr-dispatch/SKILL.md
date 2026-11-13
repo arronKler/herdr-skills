@@ -183,7 +183,7 @@ Do not default `--kind grok` for a worker. Grok's first prompt often never start
 
 - `working` after assign — normal. Use bounded fleet `watch`, not repeated per-worker polling.
 - `idle` / `done` — read `deliverable` if set, else `result_excerpt`. Script `ok` only means they finished talking.
-- `error` (herdr-core) — the terminal exited non-zero. Read the reply before deciding; do not resubmit the task blindly.
+- `error` (herdr-core) — a live agent reported an error, or a finished terminal exited non-zero. Check `state`, `exit_code`, and `reason` before deciding; do not resubmit the task blindly.
 - `blocked` — human gate. Never send y or enter to dismiss approvals.
 - Prompt stall/timeout — read `delivery` and `prompt_error`. `unconfirmed` means watch/inspect, never an automatic retry or model fallback. Replace a worker only after concrete failure evidence and inspection of its existing output; use the user’s allowed models. The original task may already be executing.
 
@@ -211,10 +211,12 @@ herdr: `assign` / `handoff` never split the captain pane.
 
 herdr-core: `assign` / `handoff` create a child terminal of the captain with `hc run --bg --name <job> --cwd <work>`.
 
-- There are no tabs or panes to place; herdr-core owns layout. The job address (`tN` or `machine/tN`) is stored as `pane_id` and used for every later verb.
-- If `--name` is already a live terminal, the script refuses; use `send --name`.
-- herdr-core kills nothing on start failure; the script reports the error JSON instead of retrying with a different command shape.
-- `stop` sends `hc kill`, which leaves a finished terminal in the list (`hc ls` hides it once hidden). `hc rm` is not run automatically.
+- There are no tabs or panes to place; herdr-core owns layout. The job address (`tN` or `machine/tN`) is stored as `pane_id` and used for every later verb (`get`, `read`, `send`, `wait`, `kill`), so a name reused by another terminal cannot redirect an existing job.
+- `--kind` names a worker CLI binary, not an `hc` template. The script resolves the binary to an absolute path before `hc run`, so native flags such as `--model` stay the program's arguments instead of becoming a template's first task.
+- If `--name` is already a live terminal, the script refuses; use `send --name`. Finished names are reusable: a new assign starts a new generation and binds the new address, while the old job keeps its old address.
+- Fleet observation uses `hc ls --all`, so a worker that exits remains observable as `done`/`error`; it does not disappear from the snapshot.
+- A failed start kills the terminal created for that attempt, so it does not leave an orphan. The script reports the error JSON instead of retrying with a different command shape.
+- `stop` sends `hc kill`; finished terminals stay listed under `hc ls --all`. `hc rm` is not run automatically.
 
 
 ## Efficiency

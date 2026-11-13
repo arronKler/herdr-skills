@@ -15,7 +15,7 @@ After `handoff`, `send --wait`, or `collect --wait`:
 3. `result_excerpt` is leftover pane/terminal chrome. Use it only when there is no `deliverable`.
 4. `result` points to the TUI dump (`pane.md` for new collections; old jobs may use `result.md`). Do not treat it as the answer. Worker `result.md` files are preserved. In herdr-core this is `hc read` output for the job terminal.
 5. `status: blocked` means an approval or question UI. Show it to the human. Do not approve.
-6. `status: error` (herdr-core only) means the terminal exited non-zero. Read the dump before deciding whether the work failed or the CLI ended after a valid reply.
+6. `status: error` (herdr-core only) means a live agent reported an error, or the terminal exited non-zero. Check `state`, `exit_code`, and `reason`, then read the dump before deciding whether the work failed or the CLI ended after a valid reply.
 
 ## Mode choice
 
@@ -28,4 +28,4 @@ After `handoff`, `send --wait`, or `collect --wait`:
 
 The dispatcher stores cwd, pane/terminal, kind, model and captain identity before sending input. `send` starts a new generation while preserving that identity, clearing previous reply/error/collection state. Collection searches the recorded worktree as well as the captain job directory and rejects older report files. No worker result schema is required.
 
-`send` refuses a working worker (queued prompts cannot be attributed to turns by herdr, and herdr-core `send` only reports the current turn) and an unconfirmed previous prompt. `watch` can reconcile a late state transition without submitting anything. A successful lifecycle observation is not evidence of correct implementation or passing tests.
+`send` refuses a working worker (queued prompts cannot be attributed to turns by herdr, and herdr-core `send` only reports the current turn) and an unconfirmed previous prompt. For an idle herdr-core worker the script also passes `--if idle`, so a worker that starts working between the check and the paste rejects the send with `status_mismatch`; nothing was typed and the job records `delivery: rejected`. `done`/`error` follow-ups have no equivalent `--if` value in hc, so there the pre-send check is best-effort; if `hc send` reports that the worker was already working, the script records `delivery_unconfirmed` instead of claiming the new turn. `watch` can reconcile a late state transition without submitting anything. A successful lifecycle observation is not evidence of correct implementation or passing tests.
