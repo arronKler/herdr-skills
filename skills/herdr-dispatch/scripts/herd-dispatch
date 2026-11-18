@@ -2525,6 +2525,7 @@ def main() -> None:
     p.add_argument("--interval", type=int, default=2000, help="fleet snapshot interval ms")
 
     p = sub.add_parser("status")
+    add_common(p)
     p.add_argument("--name", required=True)
     p.set_defaults(func=cmd_status)
 
@@ -2535,6 +2536,7 @@ def main() -> None:
     p.set_defaults(func=cmd_result)
 
     p = sub.add_parser("stop")
+    add_common(p)
     p.add_argument("--name", required=True)
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_stop)
