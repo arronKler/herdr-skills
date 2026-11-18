@@ -351,6 +351,34 @@ else:
         self.assertEqual(collected["deliverable"], str(report.resolve()))
         self.assertEqual(json.loads(fixture.read_text())["prompts"], 1)
 
+    def test_status_and_stop_accept_cwd(self):
+        binary = self.cwd / "bin" / "herdr"
+        binary.parent.mkdir()
+        binary.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            'if sys.argv[1:3] == ["agent", "list"]:\n'
+            '    print(json.dumps({"result": {"agents": []}}))\n'
+            "else:\n"
+            '    print(json.dumps({"error": {"code": "not_found"}}))\n'
+            "    sys.exit(1)\n"
+        )
+        binary.chmod(0o755)
+        env = {**os.environ, "PATH": str(binary.parent) + os.pathsep + os.environ["PATH"],
+               "HERDR_ENV": "1", "HERDR_PANE_ID": "captain", "HERDR_WORKSPACE_ID": "ws"}
+        cli = str(Path(__file__).with_name("herd-dispatch"))
+        for command, extra in (("status", []), ("stop", ["--yes"])):
+            with self.subTest(command=command):
+                proc = subprocess.run(
+                    [sys.executable, cli, command, "--name", "missing",
+                     "--cwd", str(self.cwd), *extra],
+                    env=env, text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                payload = json.loads(proc.stderr)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "no terminal found for job missing")
+
 
 if __name__ == "__main__":
     unittest.main()
